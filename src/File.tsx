@@ -27,6 +27,39 @@ import { Spacer } from "./components/Spacer";
 import WarningIcon from "@mui/icons-material/Warning";
 import { openToast } from "./components/openToast";
 
+const getDisplayName = (file) => file?.displayName || file?.name || "";
+
+const getFileSizeBytes = (file) => {
+  const candidates = [
+    file?.sizeInBytes,
+    file?.size,
+    file?.fileSize,
+    file?.dataSize,
+    file?.createdSize,
+    file?.totalSize,
+  ];
+  for (const candidate of candidates) {
+    const parsed = Number(candidate);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return null;
+};
+
+const formatBytes = (value) => {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "Unknown";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unitIndex = -1;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+  if (unitIndex < 0) return `${bytes} B`;
+  return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unitIndex]}`;
+};
+
 export const SelectedFile = ({
   selectedFile,
   setSelectedFile,
@@ -37,7 +70,8 @@ export const SelectedFile = ({
 }) => {
   const [selectedType, setSelectedType] = useState(0);
   const [isExpandMore, setIsExpandMore] = useState(false);
-  const [customFileName, setCustomFileName] = useState(selectedFile?.name)
+  const [customFileName, setCustomFileName] = useState(getDisplayName(selectedFile))
+  const fileSizeBytes = getFileSizeBytes(selectedFile);
   useEffect(() => {
     if (selectedFile?.mimeType?.toLowerCase()?.includes("image")) {
       setSelectedType("IMAGE");
@@ -45,6 +79,9 @@ export const SelectedFile = ({
       setSelectedType("ATTACHMENT");
     }
   }, [selectedFile?.mimeType]);
+  useEffect(() => {
+    setCustomFileName(getDisplayName(selectedFile));
+  }, [selectedFile?.identifier, selectedFile?.service]);
   const createEmbedLink = async () => {
    
     const promise = (async ()=> {
@@ -127,7 +164,7 @@ export const SelectedFile = ({
         >
           <Toolbar>
             <Typography sx={{ ml: 2, flex: 1 }} variant="h6" component="div">
-              {selectedFile?.name}
+              {getDisplayName(selectedFile)}
             </Typography>
             <IconButton
               edge="start"
@@ -223,6 +260,9 @@ export const SelectedFile = ({
               maxWidth: '100%'
             }}
           />
+          <Typography sx={{ fontSize: "13px", opacity: 0.82 }}>
+            Size: {fileSizeBytes === null ? "Unknown" : formatBytes(fileSizeBytes)}
+          </Typography>
             <Spacer height="10px" />
         {mode === 'private' && (
             <Box

@@ -8,15 +8,12 @@ import {
   Typography,
   styled,
 } from "@mui/material";
-import { DisplayCode } from "../components/DisplayCode";
-import { DisplayCodeResponse } from "../components/DisplayCodeResponse";
 import ShortUniqueId from "short-unique-id";
 
 import Button from "../components/Button";
 import { useDropzone } from "react-dropzone";
 import { privateServices, services } from "../constants";
 import { fileToBase64 } from "../utils";
-import toast from 'react-hot-toast';
 import { openToast } from "../components/openToast";
 
 const uid = new ShortUniqueId({ length: 10 });
@@ -33,7 +30,9 @@ export const Label = styled("label")(
 
 export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile, updateByPath , groups, selectedGroup}) => {
   const [requestData, setRequestData] = useState({
-    service: existingFile?.service || mode === 'private' ? "DOCUMENT_PRIVATE" :  "DOCUMENT"
+    service:
+      existingFile?.service ||
+      (mode === "private" ? "DOCUMENT_PRIVATE" : "DOCUMENT"),
   });
 
   const { getRootProps, getInputProps } = useDropzone({
@@ -55,6 +54,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
     const promise = (async () => {
       try {
         if (!file) throw new Error('Please select a file')
+        if (!requestData?.service) throw new Error("Please select a service")
         if(!selectedGroup) throw new Error('Please select a group')
         const findGroup = groups?.find((group)=> group.groupId === selectedGroup)
       if(!findGroup) throw new Error('Cannot find group')
@@ -95,6 +95,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
             updateByPath({
               ...existingFile,
               mimeType: file?.type,
+              sizeInBytes: file?.size,
             });
             setFile("");
             return true; // Success
@@ -106,6 +107,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
               type: "file",
               name: filename,
               mimeType: file?.type,
+              sizeInBytes: file?.size,
               qortalName: myName,
               identifier: constructedIdentifier,
               service: requestData?.service,
@@ -140,6 +142,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
     const promise = (async () => {
       try {
         if (!file) return;
+        if (!requestData?.service) throw new Error("Please select a service")
         setIsLoading(true);
   
         const fileExtension = file?.name?.includes(".") ? file.name.split(".").pop() : "";
@@ -174,6 +177,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
             updateByPath({
               ...existingFile,
               mimeType: file?.type,
+              sizeInBytes: file?.size,
             });
             setFile("");
             return true; // Success
@@ -185,6 +189,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
               type: "file",
               name: filename,
               mimeType: file?.type,
+              sizeInBytes: file?.size,
               qortalName: myName,
               identifier: constructedIdentifier,
               service: requestData?.service,
@@ -216,6 +221,9 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
       setIsLoading(true);
   
       const promise = (async () => {
+        if (!requestData?.service) {
+          throw new Error("Please select a service");
+        }
         const fileExtension = file?.name?.includes(".")
           ? file.name.split(".").pop()
           : "";
@@ -245,6 +253,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
             updateByPath({
               ...existingFile,
               mimeType: file?.type,
+              sizeInBytes: file?.size,
             });
             setFile("");
             return;
@@ -256,6 +265,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
               type: "file",
               name: filename,
               mimeType: file?.type,
+              sizeInBytes: file?.size,
               qortalName: myName,
               identifier: constructedIdentifier,
               service: requestData?.service,
@@ -322,13 +332,15 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
             MenuProps={{
               PaperProps: {
                 sx: {
-                  backgroundColor: "#333333", // Background of the dropdown
-                  color: "#ffffff", // Text color
+                  backgroundColor: "#1f2530",
+                  color: "#ffffff",
+                  backgroundImage: "none",
+                  maxHeight: 380,
                 },
               },
             }}
           >
-            <MenuItem value={0}>
+            <MenuItem disabled value=''>
               <em>No service selected</em>
             </MenuItem>
             {(mode === 'private' ? privateServices : services)?.map((service) => {

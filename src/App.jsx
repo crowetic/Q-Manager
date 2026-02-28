@@ -86,17 +86,6 @@ function App() {
     <div className="container">
       
       {isLoading && (
-             <Box sx={{
-              height: '100vh',
-              width: '100vw',
-              justifyContent: 'center',
-              alignItems: 'center',
-              display: 'flex'
-            }}>
-            <CircularProgress />
-            </Box>
-      )}
-       {!isLoading && !myAddress?.name?.name && (
         <Box sx={{
           height: '100vh',
           width: '100vw',
@@ -104,21 +93,29 @@ function App() {
           alignItems: 'center',
           display: 'flex'
         }}>
+        <CircularProgress />
+        </Box>
+      )}
+      {!isLoading && !myAddress?.name?.name && (
+        <Box sx={{
+          height: '100vh',
+          width: '100vw',
+          justifyContent: 'center',
+          alignItems: 'center',
+          display: 'flex'
+          }}>
           <Typography sx={{
             fontSize: '18px'
-          }}>
-        To use Q-Manager you need a registered Qortal Name
-      </Typography>
+            }}>
+            To use Q-Manager you need a registered Qortal Name
+          </Typography>
         </Box>
         
-       )}
-       {!isLoading && myAddress?.name?.name && (
-               <Manager myAddress={myAddress} groups={groups} />
-
-       )}
-       <Toaster
-  position="top-center"
-/>
+      )}
+      {!isLoading && myAddress?.name?.name && (
+        <Manager myAddress={myAddress} groups={groups} />
+        )}
+          <Toaster position="top-center"/>
     </div>
     </ThemeProvider>
   );

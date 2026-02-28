@@ -25,3 +25,10 @@
 .button:focus {
   outline: none;
 }
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: none;
+  box-shadow: none;
+}

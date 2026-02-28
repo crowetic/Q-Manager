@@ -1,10 +1,12 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Box, List, ListItem, ListItemButton, ListItemIcon, ListItemText, Menu, MenuItem, Modal, Typography, styled } from '@mui/material';
 import PushPinIcon from '@mui/icons-material/PushPin';
 import FolderIcon from "@mui/icons-material/Folder";
 import DeleteIcon from '@mui/icons-material/Delete';
 import DriveFileMoveIcon from '@mui/icons-material/DriveFileMove';
 import DriveFileRenameOutlineIcon from '@mui/icons-material/DriveFileRenameOutline';
+import VisibilityIcon from '@mui/icons-material/Visibility';
+import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 const CustomStyledMenu = styled(Menu)(({ theme }) => ({
     '& .MuiPaper-root': {
         backgroundColor: '#f9f9f9',
@@ -22,13 +24,76 @@ const CustomStyledMenu = styled(Menu)(({ theme }) => ({
     },
 }));
 
+const getValueByKeys = (source, keys = []) => {
+  if (!source || typeof source !== 'object') return undefined;
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) {
+      return source[key];
+    }
+  }
+  return undefined;
+};
+
+const normalizeResourceProperties = (properties) => {
+  if (!properties || typeof properties !== 'object') return {};
+
+  const filename = getValueByKeys(properties, ['filename', 'fileName']);
+  const mimeType = getValueByKeys(properties, [
+    'mimeType',
+    'mime',
+    'contentType',
+    'mediaType',
+  ]);
+  const rawSize = getValueByKeys(properties, [
+    'sizeInBytes',
+    'size',
+    'dataSize',
+    'createdSize',
+    'totalSize',
+  ]);
+  const qortalName = getValueByKeys(properties, ['name', 'qortalName', 'ownerName']);
+  const title = getValueByKeys(properties, ['title']);
+  const parsedSize = Number(rawSize);
+  const sizeInBytes =
+    Number.isFinite(parsedSize) && parsedSize >= 0 ? parsedSize : undefined;
+
+  return {
+    ...(filename ? { filename } : {}),
+    ...(mimeType ? { mimeType } : {}),
+    ...(sizeInBytes !== undefined ? { sizeInBytes } : {}),
+    ...(qortalName ? { qortalName } : {}),
+    ...(title ? { title } : {}),
+  };
+};
+
+const buildResourcePropertyPayloads = (item) => {
+  const basePayload = {
+    action: 'GET_QDN_RESOURCE_PROPERTIES',
+    service: item?.service,
+    identifier: item?.identifier,
+  };
+  const ownerName = item?.qortalName || item?.name;
+  if (!ownerName) {
+    return [basePayload];
+  }
+  return [
+    { ...basePayload, name: ownerName },
+    { ...basePayload, qortalName: ownerName },
+    basePayload,
+  ];
+};
+
 export const ContextMenuPinnedFiles = ({ children, removeFile, removeDirectory, type, rename, fileSystem, 
-moveNode, currentPath, item }) => {
+moveNode, currentPath, item, onPreview, onHydrateMetadata, pinned, onTogglePin }) => {
     const [menuPosition, setMenuPosition] = useState(null);
     const longPressTimeout = useRef(null);
     const maxHoldTimeout = useRef(null);
     const preventClick = useRef(false);
     const [showMoveModal, setShowMoveModal] = useState(false);
+    const [showInfoModal, setShowInfoModal] = useState(false);
+    const [resourceProperties, setResourceProperties] = useState(null);
+    const [resourcePropertiesError, setResourcePropertiesError] = useState('');
+    const [isFetchingResourceProperties, setIsFetchingResourceProperties] = useState(false);
     const [targetPath, setTargetPath] = useState([]);
     const startTouchPosition = useRef({ x: 0, y: 0 }); // Track initial touch position
     const handleContextMenu = (event) => {
@@ -88,9 +153,8 @@ moveNode, currentPath, item }) => {
     };
 
     const handleClose = (e) => {
-
-        e.preventDefault();
-        e.stopPropagation();
+        if (e?.preventDefault) e.preventDefault();
+        if (e?.stopPropagation) e.stopPropagation();
         setMenuPosition(null);
     };
 
@@ -174,6 +238,111 @@ moveNode, currentPath, item }) => {
       const closeMoveModal = () => {
         setShowMoveModal(false);
       };
+      const closeInfoModal = () => {
+        setShowInfoModal(false);
+      };
+
+      const hasKnownFileMetadata = useMemo(() => {
+        if (type !== 'file') return true;
+        const existingSize = getValueByKeys(item, [
+          'sizeInBytes',
+          'size',
+          'fileSize',
+          'dataSize',
+          'createdSize',
+          'totalSize',
+        ]);
+        return Boolean(item?.mimeType) && existingSize !== undefined;
+      }, [
+        item?.mimeType,
+        item?.sizeInBytes,
+        item?.size,
+        item?.fileSize,
+        item?.dataSize,
+        item?.createdSize,
+        item?.totalSize,
+        type,
+      ]);
+
+      const mergedItemInfo = useMemo(() => {
+        if (!resourceProperties) return item;
+        return {
+          ...item,
+          fetchedResourceProperties: resourceProperties,
+        };
+      }, [item, resourceProperties]);
+
+      const fetchResourceProperties = async () => {
+        if (type !== 'file' || !item?.service || !item?.identifier) {
+          return;
+        }
+
+        setIsFetchingResourceProperties(true);
+        setResourcePropertiesError('');
+
+        const payloadAttempts = buildResourcePropertyPayloads(item);
+        let lastError = null;
+
+        for (const payload of payloadAttempts) {
+          try {
+            const response = await qortalRequest(payload);
+            if (response === undefined || response === null) {
+              continue;
+            }
+
+            setResourceProperties(response);
+            const normalized = normalizeResourceProperties(response);
+            const metadataToHydrate = { ...normalized };
+            if (
+              normalized?.filename &&
+              (!item?.displayName ||
+                item?.displayName === item?.name ||
+                item?.displayName === item?.identifier)
+            ) {
+              metadataToHydrate.displayName = normalized.filename;
+            }
+            if (
+              onHydrateMetadata &&
+              typeof onHydrateMetadata === 'function' &&
+              Object.keys(metadataToHydrate).length > 0
+            ) {
+              onHydrateMetadata(metadataToHydrate);
+            }
+            setIsFetchingResourceProperties(false);
+            return;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+
+        setResourcePropertiesError(
+          lastError?.error ||
+            lastError?.message ||
+            'Unable to fetch live QDN properties'
+        );
+        setIsFetchingResourceProperties(false);
+      };
+
+      useEffect(() => {
+        setResourceProperties(null);
+        setResourcePropertiesError('');
+        setIsFetchingResourceProperties(false);
+      }, [item?.identifier, item?.service, item?.qortalName, item?.name]);
+
+      useEffect(() => {
+        if (!showInfoModal) return;
+        if (type !== 'file') return;
+        if (isFetchingResourceProperties) return;
+        if (resourceProperties) return;
+        if (hasKnownFileMetadata) return;
+        fetchResourceProperties();
+      }, [
+        showInfoModal,
+        type,
+        isFetchingResourceProperties,
+        resourceProperties,
+        hasKnownFileMetadata,
+      ]);
 
       const handleMove = () => {
         if (targetPath.length > 0) {
@@ -205,6 +374,32 @@ moveNode, currentPath, item }) => {
                     e.stopPropagation();
                 }}
             > 
+            {type === 'file' && !!onPreview && (
+                <MenuItem onClick={(e) => {
+                    handleClose(e);
+                    onPreview()
+                }}>
+                    <ListItemIcon sx={{ minWidth: '32px' }}>
+                        <VisibilityIcon fontSize="small" />
+                    </ListItemIcon>
+                    <Typography variant="inherit" sx={{ fontSize: '14px' }}>
+                        preview
+                    </Typography>
+                </MenuItem>
+            )}
+            {type === 'file' && (
+                <MenuItem onClick={(e) => {
+                    handleClose(e);
+                    onTogglePin?.();
+                }}>
+                    <ListItemIcon sx={{ minWidth: '32px' }}>
+                        <PushPinIcon fontSize="small" />
+                    </ListItemIcon>
+                    <Typography variant="inherit" sx={{ fontSize: '14px' }}>
+                        {pinned ? 'unpin file' : 'pin file'}
+                    </Typography>
+                </MenuItem>
+            )}
             {type === 'file' && (
                 <MenuItem onClick={(e) => {
                     handleClose(e);
@@ -224,7 +419,7 @@ moveNode, currentPath, item }) => {
                     removeDirectory()
                 }}>
                     <ListItemIcon sx={{ minWidth: '32px' }}>
-                        <PushPinIcon fontSize="small" />
+                        <DeleteIcon fontSize="small" />
                     </ListItemIcon>
                     <Typography variant="inherit" sx={{ fontSize: '14px' }}>
                         remove directory
@@ -253,6 +448,19 @@ moveNode, currentPath, item }) => {
           </ListItemIcon>
           <Typography variant="inherit" sx={{ fontSize: "14px" }}>
             Move
+          </Typography>
+        </MenuItem>
+        <MenuItem
+          onClick={(e) => {
+            handleClose(e);
+            setShowInfoModal(true);
+          }}
+        >
+          <ListItemIcon sx={{ minWidth: "32px" }}>
+            <InfoOutlinedIcon fontSize="small" />
+          </ListItemIcon>
+          <Typography variant="inherit" sx={{ fontSize: "14px" }}>
+            More info
           </Typography>
         </MenuItem>
             </CustomStyledMenu>
@@ -293,6 +501,64 @@ moveNode, currentPath, item }) => {
                   )
             }}>Move Here</button>
             <button onClick={closeMoveModal}>Cancel</button>
+          </Box>
+        </Box>
+      </Modal>
+      <Modal open={showInfoModal} onClose={closeInfoModal}>
+        <Box
+          sx={{
+            width: 520,
+            maxWidth: "95%",
+            margin: "auto",
+            marginTop: "8%",
+            backgroundColor: "#27282c",
+            border: "1px solid #3a3f50",
+            borderRadius: "10px",
+            boxShadow: 24,
+            p: 3,
+            overflow: "auto",
+            maxHeight: "80vh",
+          }}
+        >
+          <Typography sx={{ fontSize: "18px", mb: 1 }}>Item details</Typography>
+          <Typography sx={{ fontSize: "13px", opacity: 0.75, mb: 2 }}>
+            Showing all known metadata for this item.
+          </Typography>
+          {type === 'file' && (
+            <Box sx={{ display: 'flex', gap: '10px', alignItems: 'center', mb: 2 }}>
+              <button
+                onClick={fetchResourceProperties}
+                disabled={
+                  isFetchingResourceProperties || !item?.service || !item?.identifier
+                }
+              >
+                {isFetchingResourceProperties
+                  ? 'Fetching properties...'
+                  : 'Fetch QDN properties'}
+              </button>
+              {resourcePropertiesError && (
+                <Typography sx={{ fontSize: "12px", color: "#ff8f8f" }}>
+                  {resourcePropertiesError}
+                </Typography>
+              )}
+            </Box>
+          )}
+          <Box
+            component="pre"
+            sx={{
+              backgroundColor: "rgba(0,0,0,0.2)",
+              borderRadius: "8px",
+              p: 2,
+              fontSize: "12px",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              color: "#d7e0ef",
+            }}
+          >
+            {JSON.stringify(mergedItemInfo, null, 2)}
+          </Box>
+          <Box mt={2}>
+            <button onClick={closeInfoModal}>Close</button>
           </Box>
         </Box>
       </Modal>

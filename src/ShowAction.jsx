@@ -18,10 +18,10 @@ export const Transition = React.forwardRef(function Transition(props, ref) {
   return <Slide direction="up" ref={ref} {...props} />;
 });
 
-export const ShowAction = ({ selectedAction, handleClose, myName, addNodeByPath, mode , groups, selectedGroup}) => {
+export const ShowAction = ({ selectedAction, handleClose, myName, addNodeByPath, mode , groups, selectedGroup, }) => {
   const ActionComponent = useMemo(() => {
     switch (selectedAction?.action) {
-     
+      
       case "PUBLISH_QDN_RESOURCE":
         return PUBLISH_QDN_RESOURCE;
       case "PUBLISH_MULTIPLE_QDN_RESOURCES":
@@ -70,7 +70,7 @@ export const ShowAction = ({ selectedAction, handleClose, myName, addNodeByPath,
             overflowY: "auto",
           }}
         >
-          <ActionComponent myName={myName} addNodeByPath={addNodeByPath} mode={mode} groups={groups} selectedGroup={selectedGroup} />
+          <ActionComponent myName={myName} addNodeByPath={addNodeByPath} mode={mode} groups={groups} selectedGroup={selectedGroup} files={selectedAction?.files || []}/>
         </Box>
         {/* <LoadingSnackbar
           open={false}

@@ -1,15 +1,12 @@
-export function objectToBase64(obj: Object) {
-	// Step 1: Convert the object to a JSON string
+export function objectToBase64(obj: unknown): Promise<string> {
 	const jsonString = JSON.stringify(obj)
-	// Step 2: Create a Blob from the JSON string
 	const blob = new Blob([jsonString], { type: 'application/json' })
-	// Step 3: Create a FileReader to read the Blob as a base64-encoded string
-	return new Promise((resolve, reject) => {
-		const reader = new FileReader()
-		reader.onloadend = () => {
-			if (typeof reader.result === 'string') {
-				// Remove 'data:application/json;base64,' prefix
-				const base64 = reader.result.replace(
+
+	return new Promise<string>((resolve, reject) => {
+		const localReader = new FileReader()
+		localReader.onloadend = () => {
+			if (typeof localReader.result === 'string') {
+				const base64 = localReader.result.replace(
 					'data:application/json;base64,',
 					''
 				)
@@ -18,76 +15,74 @@ export function objectToBase64(obj: Object) {
 				reject(new Error('Failed to read the Blob as a base64-encoded string'))
 			}
 		}
-		reader.onerror = () => {
-			reject(reader.error)
+		localReader.onerror = () => {
+			reject(localReader.error ?? new Error('Failed to read the file'))
 		}
-		reader.readAsDataURL(blob)
+		localReader.readAsDataURL(blob)
 	})
 }
 
-export function base64ToUint8Array(base64: string) {
-    const binaryString = atob(base64)
-    const len = binaryString.length
-    const bytes = new Uint8Array(len)
+export function base64ToUint8Array(base64: string): Uint8Array {
+	const binaryString = atob(base64)
+	const len = binaryString.length
+	const bytes = new Uint8Array(len)
 
-    for (let i = 0; i < len; i++) {
-      bytes[i] = binaryString.charCodeAt(i)
-    }
+	for (let i = 0; i < len; i++) {
+		bytes[i] = binaryString.charCodeAt(i)
+	}
 
-    return bytes
-  }
+	return bytes
+}
 
-  export function uint8ArrayToObject(uint8Array: Uint8Array) {
-    // Decode the byte array using TextDecoder
-    const decoder = new TextDecoder()
-    const jsonString = decoder.decode(uint8Array)
+export function uint8ArrayToObject<T = unknown>(uint8Array: Uint8Array): T {
+	const decoder = new TextDecoder()
+	const jsonString = decoder.decode(uint8Array)
+	return JSON.parse(jsonString) as T
+}
 
-    // Convert the JSON string back into an object
-    const obj = JSON.parse(jsonString)
+export const handleImportClick = async (): Promise<string> => {
+	const fileInput = document.createElement('input')
+	fileInput.type = 'file'
+	fileInput.accept = '.base64,.txt'
 
-    return obj
-  }
+	return new Promise<string>((resolve, reject) => {
+		fileInput.onchange = () => {
+			const file = fileInput.files?.[0]
+			if (!file) {
+				reject(new Error('No file selected'))
+				return
+			}
 
+			const localReader = new FileReader()
+			localReader.onload = () => {
+				if (typeof localReader.result === 'string') {
+					resolve(localReader.result)
+				} else {
+					reject(new Error('Invalid file content'))
+				}
+			}
+			localReader.onerror = () => {
+				reject(localReader.error ?? new Error('Error reading file'))
+			}
 
-  export const handleImportClick = async () => {
-    const fileInput = document.createElement('input');
-    fileInput.type = 'file';
-    fileInput.accept = '.base64,.txt';
+			localReader.readAsText(file)
+		}
 
-    // Create a promise to handle file selection and reading synchronously
-    return await new Promise((resolve, reject) => {
-      fileInput.onchange = () => {
-        const file = fileInput.files[0];
-        if (!file) {
-          reject(new Error('No file selected'));
-          return;
-        }
+		fileInput.click()
+	})
+}
 
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          resolve(e.target.result); // Resolve with the file content
-        };
-        reader.onerror = () => {
-          reject(new Error('Error reading file'));
-        };
+class Semaphore {
+	private count: number
+	private waiting: Array<() => void>
 
-        reader.readAsText(file); // Read the file as text (Base64 string)
-      };
-
-      // Trigger the file input dialog
-      fileInput.click();
-    });
-
-  }
-
-
-  class Semaphore {
-	constructor(count) {
+	constructor(count: number) {
 		this.count = count
 		this.waiting = []
 	}
-	acquire() {
-		return new Promise(resolve => {
+
+	acquire(): Promise<void> {
+		return new Promise<void>(resolve => {
 			if (this.count > 0) {
 				this.count--
 				resolve()
@@ -96,43 +91,56 @@ export function base64ToUint8Array(base64: string) {
 			}
 		})
 	}
-	release() {
+
+	release(): void {
 		if (this.waiting.length > 0) {
 			const resolve = this.waiting.shift()
-			resolve()
+			if (resolve) resolve()
 		} else {
 			this.count++
 		}
 	}
 }
 
-  let semaphore = new Semaphore(1)
-let reader = new FileReader()
+const semaphore = new Semaphore(1)
+let reader: FileReader | null = new FileReader()
 
-export const fileToBase64 = (file) => new Promise(async (resolve, reject) => {
-	if (!reader) {
-		reader = new FileReader()
-	}
+export const fileToBase64 = async (file: Blob): Promise<string> => {
 	await semaphore.acquire()
-	reader.readAsDataURL(file)
-	reader.onload = () => {
-		const dataUrl = reader.result
-		if (typeof dataUrl === "string") {
-			const base64String = dataUrl.split(',')[1]
+
+	try {
+		if (!reader) {
+			reader = new FileReader()
+		}
+
+		const currentReader = reader as FileReader
+
+		return await new Promise<string>((resolve, reject) => {
+			currentReader.onload = () => {
+				const dataUrl = currentReader.result
+				if (typeof dataUrl === 'string') {
+					const base64String = dataUrl.split(',')[1]
+					if (base64String === undefined) {
+						reject(new Error('Invalid data URL'))
+						return
+					}
+					resolve(base64String)
+				} else {
+					reject(new Error('Invalid data URL'))
+				}
+			}
+
+			currentReader.onerror = () => {
+				reject(currentReader.error ?? new Error('Failed to read file'))
+			}
+
+			currentReader.readAsDataURL(file)
+		})
+	} finally {
+		if (reader) {
 			reader.onload = null
 			reader.onerror = null
-			resolve(base64String)
-		} else {
-			reader.onload = null
-			reader.onerror = null
-			reject(new Error('Invalid data URL'))
 		}
 		semaphore.release()
 	}
-	reader.onerror = (error) => {
-		reader.onload = null
-		reader.onerror = null
-		reject(error)
-		semaphore.release()
-	}
-})
+}
