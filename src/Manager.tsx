@@ -129,11 +129,46 @@ const EXTRA_TEXT_MIME_TYPES = new Set([
   "application/sql",
 ]);
 
+const getServiceName = (file) => {
+  const candidates = [file?.service, file?.service?.name, file?.serviceName];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate;
+    }
+  }
+  return "";
+};
+
 const getResourcePreviewUrl = (file) => {
-  if (!file?.service || !file?.qortalName || !file?.identifier) return "";
-  return `/arbitrary/${encodeURIComponent(file.service)}/${encodeURIComponent(
-    file.qortalName
+  const service = getServiceName(file);
+  const qortalName =
+    typeof file?.qortalName === "string" && file.qortalName.trim()
+      ? file.qortalName
+      : "";
+  if (!service || !qortalName || !file?.identifier) return "";
+  return `/arbitrary/${encodeURIComponent(service)}/${encodeURIComponent(
+    qortalName
   )}/${encodeURIComponent(file.identifier)}`;
+};
+
+const safeLower = (value) => {
+  if (typeof value === "string") return value.toLowerCase();
+  if (value === undefined || value === null) return "";
+  try {
+    return String(value).toLowerCase();
+  } catch (error) {
+    return "";
+  }
+};
+
+const safeUpper = (value) => {
+  if (typeof value === "string") return value.toUpperCase();
+  if (value === undefined || value === null) return "";
+  try {
+    return String(value).toUpperCase();
+  } catch (error) {
+    return "";
+  }
 };
 
 const getFileNameForInference = (file) => {
@@ -156,11 +191,11 @@ const getFileExtension = (file) => {
   const name = getFileNameForInference(file);
   const parts = name.split(".");
   if (parts.length < 2) return "";
-  return parts.pop().toLowerCase();
+  return safeLower(parts.pop());
 };
 
 const inferMimeTypeFromExtension = (extension) => {
-  const ext = (extension || "").toLowerCase();
+  const ext = safeLower(extension);
   if (!ext) return "";
 
   const extensionToMime = {
@@ -222,16 +257,20 @@ const inferMimeTypeFromExtension = (extension) => {
 };
 
 const isTextLikeMimeType = (mimeType) => {
-  const normalized = (mimeType || "").toLowerCase();
+  const normalized = safeLower(mimeType);
   if (!normalized) return false;
   if (normalized.startsWith("text/")) return true;
   return EXTRA_TEXT_MIME_TYPES.has(normalized);
 };
 
 const inferPreviewKind = (file) => {
-  const mime = (file?.mimeType || "").toLowerCase();
-  const service = (file?.service || "").toUpperCase();
-  const name = getFileNameForInference(file).toLowerCase();
+  const mime = safeLower(file?.mimeType);
+  const service =
+    safeUpper(getServiceName(file)) ||
+    safeUpper(file?.service) ||
+    safeUpper(file?.service?.name) ||
+    safeUpper(file?.serviceName);
+  const name = safeLower(getFileNameForInference(file));
   const extension = getFileExtension(file);
   const extensionMime = inferMimeTypeFromExtension(extension);
   const effectiveMime = mime || extensionMime;

@@ -139,6 +139,10 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
       // 3) update tree exactly like single publish
       for (const res of Array.isArray(result) ? result : [result]) {
         const { identifier, service, filename, mimeType } = res;
+        const normalizedService =
+          (typeof service === "string" && service) ||
+          (typeof service?.name === "string" && service.name) ||
+          requestData.service;
         const localMeta = localMetaByIdentifier.get(identifier) || {};
         const resolvedFilename = filename || localMeta?.filename || identifier;
         const resolvedMimeType =
@@ -168,7 +172,7 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
           ...(sizeInBytes !== undefined ? { sizeInBytes } : {}),
           qortalName: myName,
           identifier,
-          service,
+          service: normalizedService,
           ...groupEntry,
         });
       }
