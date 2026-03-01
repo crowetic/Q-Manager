@@ -2,6 +2,7 @@
 import {
   base64ToUint8Array,
   objectToBase64,
+  resolvePreferredName,
   uint8ArrayToObject,
 } from "./utils";
 import { privateServices, services } from "./constants";
@@ -249,9 +250,15 @@ export const getPersistedFileSystemQManager = async (address) => {
 
 export const publishFileSystemQManagerToQDN = async ({
   fileSystemQManager,
+  name,
+  address,
 }) => {
   if (!fileSystemQManager) {
     throw new Error("No filesystem data available to publish");
+  }
+  const resolvedName = await resolvePreferredName(name, address);
+  if (!resolvedName || typeof resolvedName !== "string") {
+    throw new Error("Qortal name is required to publish filesystem to QDN");
   }
 
   const plainData64 = await objectToBase64(fileSystemQManager);
@@ -266,6 +273,7 @@ export const publishFileSystemQManagerToQDN = async ({
 
   return qortalRequest({
     action: "PUBLISH_QDN_RESOURCE",
+    name: resolvedName,
     service: "DOCUMENT_PRIVATE",
     identifier: QDN_STRUCTURE_IDENTIFIER,
     filename: QDN_STRUCTURE_FILENAME,

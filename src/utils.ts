@@ -144,3 +144,75 @@ export const fileToBase64 = async (file: Blob): Promise<string> => {
 		semaphore.release()
 	}
 }
+
+const extractNameString = (value: unknown): string => {
+	if (typeof value === 'string') {
+		return value.trim()
+	}
+	if (value && typeof value === 'object') {
+		const entry = value as Record<string, unknown>
+		if (typeof entry.name === 'string') return entry.name.trim()
+		if (typeof entry.primaryName === 'string') return entry.primaryName.trim()
+	}
+	return ''
+}
+
+const extractPrimaryName = (payload: unknown): string => {
+	if (Array.isArray(payload)) {
+		for (const entry of payload) {
+			const candidate = extractNameString(entry)
+			if (candidate) return candidate
+		}
+		return ''
+	}
+	return extractNameString(payload)
+}
+
+export const resolvePreferredName = async (
+	candidateName?: string,
+	candidateAddress?: string
+): Promise<string> => {
+	if (typeof candidateName === 'string' && candidateName.trim()) {
+		return candidateName.trim()
+	}
+
+	let resolvedAddress =
+		typeof candidateAddress === 'string' && candidateAddress.trim()
+			? candidateAddress.trim()
+			: ''
+
+	try {
+		const primary = await qortalRequest({
+			action: 'GET_PRIMARY_NAME',
+			...(resolvedAddress ? { address: resolvedAddress } : {}),
+		})
+		const primaryName = extractPrimaryName(primary)
+		if (primaryName) return primaryName
+	} catch (error) {}
+
+	if (!resolvedAddress) {
+		try {
+			const account = await qortalRequest({ action: 'GET_USER_ACCOUNT' })
+			if (account?.address && typeof account.address === 'string') {
+				resolvedAddress = account.address
+			}
+		} catch (error) {}
+	}
+
+	if (!resolvedAddress) return ''
+
+	try {
+		const accountNames = await qortalRequest({
+			action: 'GET_ACCOUNT_NAMES',
+			address: resolvedAddress,
+		})
+		if (Array.isArray(accountNames)) {
+			for (const entry of accountNames) {
+				const name = extractNameString(entry)
+				if (name) return name
+			}
+		}
+	} catch (error) {}
+
+	return ''
+}

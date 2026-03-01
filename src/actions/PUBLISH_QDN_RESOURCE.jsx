@@ -13,7 +13,7 @@ import ShortUniqueId from "short-unique-id";
 import Button from "../components/Button";
 import { useDropzone } from "react-dropzone";
 import { privateServices, services } from "../constants";
-import { fileToBase64 } from "../utils";
+import { fileToBase64, resolvePreferredName } from "../utils";
 import { openToast } from "../components/openToast";
 
 const uid = new ShortUniqueId({ length: 10 });
@@ -46,6 +46,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
   });
   const [isLoading, setIsLoading] = useState(false);
   const [file, setFile] = useState(null);
+  const ownerName = typeof myName === "string" ? myName : "";
 
 
 
@@ -55,6 +56,8 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
       try {
         if (!file) throw new Error('Please select a file')
         if (!requestData?.service) throw new Error("Please select a service")
+        const resolvedOwnerName = await resolvePreferredName(ownerName)
+        if (!resolvedOwnerName) throw new Error("Could not determine Qortal name")
         if(!selectedGroup) throw new Error('Please select a group')
         const findGroup = groups?.find((group)=> group.groupId === selectedGroup)
       if(!findGroup) throw new Error('Cannot find group')
@@ -83,6 +86,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
   
         let account = await qortalRequest({
           action: "PUBLISH_QDN_RESOURCE",
+          name: resolvedOwnerName,
           service: existingFile?.service || requestData?.service,
           identifier: constructedIdentifier,
           data64: encryptedData,
@@ -143,6 +147,8 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
       try {
         if (!file) return;
         if (!requestData?.service) throw new Error("Please select a service")
+        const resolvedOwnerName = await resolvePreferredName(ownerName)
+        if (!resolvedOwnerName) throw new Error("Could not determine Qortal name")
         setIsLoading(true);
   
         const fileExtension = file?.name?.includes(".") ? file.name.split(".").pop() : "";
@@ -167,6 +173,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
   
         let account = await qortalRequest({
           action: "PUBLISH_QDN_RESOURCE",
+          name: resolvedOwnerName,
           service: existingFile?.service || requestData?.service,
           identifier: constructedIdentifier,
           data64: encryptedData,
@@ -224,6 +231,10 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
         if (!requestData?.service) {
           throw new Error("Please select a service");
         }
+        const resolvedOwnerName = await resolvePreferredName(ownerName)
+        if (!resolvedOwnerName) {
+          throw new Error("Could not determine Qortal name");
+        }
         const fileExtension = file?.name?.includes(".")
           ? file.name.split(".").pop()
           : "";
@@ -242,6 +253,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
           existingFile?.identifier || `q-manager-858-${uid.rnd()}`;
         const account = await qortalRequest({
           action: "PUBLISH_QDN_RESOURCE",
+          name: resolvedOwnerName,
           service: existingFile?.service || requestData?.service,
           identifier: constructedIdentifier,
           file,

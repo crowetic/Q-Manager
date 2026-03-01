@@ -65,6 +65,7 @@ import {
   base64ToUint8Array,
   handleImportClick,
   objectToBase64,
+  resolvePreferredName,
   uint8ArrayToObject,
 } from "./utils";
 import { openToast } from "./components/openToast";
@@ -744,7 +745,13 @@ const SortableItem = ({
   );
 };
 
-export const Manager = ({ myAddress, groups }) => {
+export const Manager = ({
+  myAddress,
+  groups,
+  ownedNames = [],
+  activeName = "",
+  onChangeActiveName,
+}) => {
   const [fileSystemPublic, setFileSystemPublic] = useState(null);
   const [fileSystemPrivate, setFileSystemPrivate] = useState(null);
   const [fileSystemGroup, setFileSystemGroup] = useState(initialGroupFileSystem);
@@ -795,6 +802,10 @@ export const Manager = ({ myAddress, groups }) => {
   });
   const [showBulkMoveModal, setShowBulkMoveModal] = useState(false);
   const [bulkMoveTargetPath, setBulkMoveTargetPath] = useState([]);
+  const currentName =
+    (typeof activeName === "string" && activeName.trim()) ||
+    (typeof myAddress?.name?.name === "string" && myAddress.name.name.trim()) ||
+    "";
 
   const [currentPath, setCurrentPath] = useState(["Root"]);
   const [isOpenPublish, setIsOpenPublish] = useState(false);
@@ -1116,7 +1127,7 @@ export const Manager = ({ myAddress, groups }) => {
 
   const discoverAndImportPublishedQManagerFiles = async () => {
     const promise = (async () => {
-      const ownerName = myAddress?.name?.name;
+      const ownerName = await resolvePreferredName(currentName, myAddress?.address);
       if (!ownerName) {
         throw new Error("Could not determine your Qortal name");
       }
@@ -1746,19 +1757,55 @@ export const Manager = ({ myAddress, groups }) => {
     if (selectedVisibleFiles.length === 0) return;
     const filesToDelete = [...selectedVisibleFiles];
     const tombstoneData64 = btoa("d");
+    const ownerName = await resolvePreferredName(currentName, myAddress?.address);
 
     const promise = (async () => {
-      removeSelectedFromManager();
-
-      for (const file of filesToDelete) {
-        if (!file?.identifier || !file?.service) continue;
-        await qortalRequest({
-          action: "PUBLISH_QDN_RESOURCE",
-          service: file.service,
-          identifier: file.identifier,
-          data64: tombstoneData64,
-        });
+      if (!ownerName || typeof ownerName !== "string") {
+        throw new Error("Could not determine Qortal name for delete");
       }
+      const resources = filesToDelete
+        .map((file) => ({
+          service: getServiceName(file),
+          identifier: file?.identifier,
+          data64: tombstoneData64,
+        }))
+        .filter((resource) => resource?.service && resource?.identifier);
+
+      if (resources.length === 0) {
+        throw new Error("No valid files selected for QDN delete");
+      }
+
+      try {
+        await qortalRequest({
+          action: "PUBLISH_MULTIPLE_QDN_RESOURCES",
+          name: ownerName,
+          resources,
+        });
+      } catch (multiDeleteError) {
+        const failedIdentifiers = [];
+        for (const resource of resources) {
+          try {
+            await qortalRequest({
+              action: "PUBLISH_QDN_RESOURCE",
+              name: ownerName,
+              service: resource.service,
+              identifier: resource.identifier,
+              data64: resource.data64,
+            });
+          } catch (singleDeleteError) {
+            failedIdentifiers.push(resource.identifier);
+          }
+        }
+        if (failedIdentifiers.length > 0) {
+          throw new Error(
+            `Failed to delete ${failedIdentifiers.length} item(s): ${failedIdentifiers.join(
+              ", "
+            )}`
+          );
+        }
+      }
+
+      removeSelectedFromManager();
     })();
 
     openToast(promise, {
@@ -1807,6 +1854,38 @@ export const Manager = ({ myAddress, groups }) => {
           Q-Manager
         </Typography>
       </Box>
+      {ownedNames?.length > 1 && (
+        <Box
+          sx={{
+            px: "20px",
+            pb: "8px",
+          }}
+        >
+          <Label>Active name</Label>
+          <Select
+            size='small'
+            value={currentName}
+            onChange={(e) => {
+              onChangeActiveName?.(e.target.value);
+            }}
+            sx={{ width: "300px" }}
+            MenuProps={{
+              PaperProps: {
+                sx: {
+                  backgroundColor: "#333333",
+                  color: "#ffffff",
+                },
+              },
+            }}
+          >
+            {ownedNames.map((nameValue) => (
+              <MenuItem key={nameValue} value={nameValue}>
+                {nameValue}
+              </MenuItem>
+            ))}
+          </Select>
+        </Box>
+      )}
       {mode === "group" && (
         <Box
           sx={{
@@ -2114,7 +2193,7 @@ export const Manager = ({ myAddress, groups }) => {
 
       {isOpenPublish && (
         <ShowAction
-          myName={myAddress?.name?.name}
+          myName={currentName}
           addNodeByPath={addNodeByPath}
           handleClose={() => setIsOpenPublish(false)}
           selectedAction={{
@@ -2319,7 +2398,13 @@ export const Manager = ({ myAddress, groups }) => {
                   <Button
                     variant='contained'
                     onClick={async () => {
+                      const resolvedName = await resolvePreferredName(
+                        currentName,
+                        myAddress?.address
+                      );
                       const promise = publishFileSystemQManagerToQDN({
+                        name: resolvedName,
+                        address: myAddress?.address,
                         fileSystemQManager: {
                           public: fileSystemPublic,
                           private: fileSystemPrivate,
@@ -2341,9 +2426,11 @@ export const Manager = ({ myAddress, groups }) => {
                   <Button
                     variant='contained'
                     onClick={async () => {
-                      const promise = importFileSystemQManagerFromQDN(
-                        myAddress?.name?.name
+                      const resolvedName = await resolvePreferredName(
+                        currentName,
+                        myAddress?.address
                       );
+                      const promise = importFileSystemQManagerFromQDN(resolvedName);
 
                       openToast(promise, {
                         loading: "Importing filesystem structure from QDN...",
