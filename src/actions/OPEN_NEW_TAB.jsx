@@ -5,6 +5,7 @@ import { DisplayCodeResponse } from "../components/DisplayCodeResponse";
 
 import beautify from "js-beautify";
 import Button from "../components/Button";
+import { requestQortal } from "../qapp/request";
 
 export const Label = styled("label")(
   ({ theme }) => `
@@ -55,11 +56,11 @@ await qortalRequest({
   const executeQortalRequest = async () => {
     try {
       setIsLoading(true)
-      // let account = await qortalRequest({
+      // let account = await requestQortal({
       //   action: "OPEN_NEW_TAB",
       //   qortalLink: requestData?.qortalLink,
       // });
-      let account = await qortalRequest({
+      let account = await requestQortal({
         action: "CREATE_AND_COPY_EMBED_LINK",
         name: 'SHOULD MINTING REQUIRE A NAME?',
         type: 'POLL',

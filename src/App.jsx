@@ -1,14 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { Box, CircularProgress, CssBaseline, MenuItem, Select, ThemeProvider, Tooltip, Typography, createTheme } from "@mui/material";
+import { Box, CircularProgress, CssBaseline, ThemeProvider, Typography, createTheme } from "@mui/material";
 import "./App.css";
-import Container from "./components/Container";
-import QSandboxLogo from "./assets/images/QSandboxLogo.png";
-import InfoIcon from "@mui/icons-material/Info";
-import { categories } from "./constants";
-import { ShowCategories } from "./ShowCategories";
-import { ShowAction } from "./ShowAction";
 import { Manager } from "./Manager";
 import { Toaster } from "react-hot-toast";
+import { requestQortal } from "./qapp/request";
 
 const theme = createTheme({
   palette: {
@@ -35,15 +30,15 @@ function App() {
   const [groups, setGroups] = useState([])
   const askForAccountInformation = useCallback(async () => {
     try {
-      const account = await qortalRequest({
+      const account = await requestQortal({
         action: "GET_USER_ACCOUNT",
       });
       if(account?.address){
-        const nameData = await qortalRequest({
+        const nameData = await requestQortal({
           action: "GET_ACCOUNT_NAMES",
           address: account.address,
         });
-        setMyaddress({...account, name: nameData[0] || ""})
+        setMyaddress({...account, name: nameData[0] || "", names: nameData || []})
       }
     } catch (error) {
       console.error(error);
@@ -55,7 +50,7 @@ function App() {
   const getGroups = useCallback(async (address) => {
     try {
       const res = await fetch(`/groups/member/${address}`);
-   
+  
         const data = await res.json()
         setGroups(data)
       
@@ -69,9 +64,6 @@ function App() {
   useEffect(()=> {
     askForAccountInformation()
   }, [askForAccountInformation])
-  const handleClose = useCallback(()=> {
-    setSelectedAction(null)
-  }, [])
 
   useEffect(()=> {
     if(myAddress?.address){
@@ -122,5 +114,3 @@ function App() {
 }
 
 export default App;
-
-

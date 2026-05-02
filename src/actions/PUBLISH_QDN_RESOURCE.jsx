@@ -13,10 +13,92 @@ import ShortUniqueId from "short-unique-id";
 import Button from "../components/Button";
 import { useDropzone } from "react-dropzone";
 import { privateServices, services } from "../constants";
-import { fileToBase64 } from "../utils";
+import { fileToBase64, objectToBase64 } from "../utils";
 import { openToast } from "../components/openToast";
+import { requestQortal } from "../qapp/request";
+import { upsertPrivateResourceIndexEntry } from "../storage";
 
 const uid = new ShortUniqueId({ length: 10 });
+
+const normalizeEncryptedSharingKeyResponse = (response) => {
+  if (response === null || response === undefined) {
+    return {
+      data64: "",
+      sharingKey: "",
+      publicKey: "",
+    };
+  }
+
+  if (typeof response === "string") {
+    const trimmed = response.trim();
+    if (!trimmed) {
+      return {
+        data64: "",
+        sharingKey: "",
+        publicKey: "",
+      };
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object") {
+        return {
+          data64:
+            parsed?.data64 ||
+            parsed?.data ||
+            parsed?.encryptedData ||
+            parsed?.payload ||
+            "",
+          sharingKey: parsed?.key || parsed?.sharingKey || "",
+          publicKey: parsed?.publicKey || "",
+          raw: parsed,
+        };
+      }
+    } catch (error) {}
+
+    return {
+      data64: trimmed,
+      sharingKey: "",
+      publicKey: "",
+      raw: response,
+    };
+  }
+
+  if (typeof response === "object") {
+    return {
+      data64:
+        response?.data64 ||
+        response?.data ||
+        response?.encryptedData ||
+        response?.payload ||
+        "",
+      sharingKey: response?.key || response?.sharingKey || "",
+      publicKey: response?.publicKey || "",
+      raw: response,
+    };
+  }
+
+  return {
+    data64: String(response),
+    sharingKey: "",
+    publicKey: "",
+    raw: response,
+  };
+};
+
+const buildEncryptedResourcePayload = async ({ data64, filename, file }) => {
+  return objectToBase64({
+    qManagerEncryptedResource: true,
+    version: 1,
+    data: data64,
+    metadata: {
+      filename,
+      displayName: filename,
+      mimeType: file?.type || "application/octet-stream",
+      sizeInBytes: Number(file?.size) || 0,
+    },
+  });
+};
 
 export const Label = styled("label")(
   ({ theme }) => `
@@ -28,7 +110,7 @@ export const Label = styled("label")(
     `
 );
 
-export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile, updateByPath , groups, selectedGroup}) => {
+export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, accountPublicKey, mode, existingFile, updateByPath , groups, selectedGroup}) => {
   const [requestData, setRequestData] = useState({
     service:
       existingFile?.service ||
@@ -47,6 +129,46 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
   const [isLoading, setIsLoading] = useState(false);
   const [file, setFile] = useState(null);
 
+  const recordPrivateIndexEntry = async ({
+    indexOwner,
+    identifier,
+    filename,
+    mimeType,
+    sizeInBytes,
+    encryptionType,
+    sharingKey,
+    publicKey,
+    groupId,
+    groupName,
+    service,
+  }) => {
+    if (!indexOwner) return;
+    await upsertPrivateResourceIndexEntry(indexOwner, {
+      resourceKey: [
+        accountAddress || myName || indexOwner || "",
+        service || "",
+        identifier || "",
+        groupId || 0,
+      ].join("|"),
+      qortalName: myName,
+      service,
+      identifier,
+      filename,
+      displayName: filename,
+      mimeType,
+      sizeInBytes,
+      encryptionType,
+      ...(sharingKey ? { sharingKey } : {}),
+      ...(publicKey ? { publicKey } : {}),
+      ...(groupId
+        ? {
+            group: groupId,
+            groupId,
+            groupName,
+          }
+        : {}),
+    });
+  };
 
 
 
@@ -71,18 +193,25 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
         const filename = fileExtension ? `${fileTitle}.${fileExtension}` : fileTitle;
   
   
-        const constructedIdentifier = existingFile?.identifier || `grp-q-manager-858-${uid.rnd()}`;
+        const constructedIdentifier =
+          existingFile?.identifier || `grp-${selectedGroup}-q-manager-${uid.rnd()}`;
         const base64File = await fileToBase64(file);
-        const encryptedData = await qortalRequest({
-          action: "ENCRYPT_QORTAL_GROUP_DATA",
+        const encryptedPayload = await buildEncryptedResourcePayload({
           data64: base64File,
+          filename,
+          file,
+        });
+        const encryptedData = await requestQortal({
+          action: "ENCRYPT_QORTAL_GROUP_DATA",
+          data64: encryptedPayload,
           groupId: selectedGroup
         });
 
         if(!encryptedData) throw new Error('Unable to encrypt data')
   
-        let account = await qortalRequest({
+        let account = await requestQortal({
           action: "PUBLISH_QDN_RESOURCE",
+          name: myName,
           service: existingFile?.service || requestData?.service,
           identifier: constructedIdentifier,
           data64: encryptedData,
@@ -94,18 +223,36 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
           if (!!existingFile) {
             updateByPath({
               ...existingFile,
+              name: filename,
+              displayName: filename,
               mimeType: file?.type,
               sizeInBytes: file?.size,
+              encryptionType: "group",
+              group: selectedGroup,
+              groupId: selectedGroup,
+              groupName: findGroup?.groupName,
             });
             setFile("");
+            await recordPrivateIndexEntry({
+              indexOwner: accountAddress || myName,
+              identifier: constructedIdentifier,
+              filename,
+              mimeType: file?.type,
+              sizeInBytes: file?.size,
+              encryptionType: "group",
+              groupId: selectedGroup,
+              groupName: findGroup?.groupName,
+              service: requestData?.service,
+            });
             return true; // Success
           }
-  
+
           addNodeByPath(
             undefined,
             {
               type: "file",
               name: filename,
+              displayName: filename,
               mimeType: file?.type,
               sizeInBytes: file?.size,
               qortalName: myName,
@@ -116,7 +263,19 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
             },
             undefined
           );
-  
+
+          await recordPrivateIndexEntry({
+            indexOwner: accountAddress || myName,
+            identifier: constructedIdentifier,
+            filename,
+            mimeType: file?.type,
+            sizeInBytes: file?.size,
+            encryptionType: "group",
+            groupId: selectedGroup,
+            groupName: findGroup?.groupName,
+            service: requestData?.service,
+          });
+
             
           return true; // Success
         } else {
@@ -158,15 +317,23 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
   
         const constructedIdentifier = existingFile?.identifier || `p-q-manager-858-${uid.rnd()}`;
         const base64File = await fileToBase64(file);
-        const encryptedData = await qortalRequest({
-          action: "ENCRYPT_DATA_WITH_SHARING_KEY",
+        const encryptedPayload = await buildEncryptedResourcePayload({
           data64: base64File,
+          filename,
+          file,
         });
+        const encryptedResponse = await requestQortal({
+          action: "ENCRYPT_DATA_WITH_SHARING_KEY",
+          data64: encryptedPayload,
+        });
+        const { data64: encryptedData, sharingKey, publicKey } =
+          normalizeEncryptedSharingKeyResponse(encryptedResponse);
 
         if(!encryptedData) throw new Error('Unable to encrypt data')
   
-        let account = await qortalRequest({
+        let account = await requestQortal({
           action: "PUBLISH_QDN_RESOURCE",
+          name: myName,
           service: existingFile?.service || requestData?.service,
           identifier: constructedIdentifier,
           data64: encryptedData,
@@ -176,27 +343,58 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
           if (!!existingFile) {
             updateByPath({
               ...existingFile,
+              name: filename,
+              displayName: filename,
               mimeType: file?.type,
               sizeInBytes: file?.size,
+              encryptionType: "private",
+              ...(sharingKey ? { sharingKey } : {}),
+              ...(accountPublicKey ? { publicKey: accountPublicKey } : {}),
             });
             setFile("");
+            await recordPrivateIndexEntry({
+              indexOwner: accountAddress || myName,
+              identifier: constructedIdentifier,
+              filename,
+              mimeType: file?.type,
+              sizeInBytes: file?.size,
+              encryptionType: "private",
+              sharingKey,
+              publicKey: accountPublicKey || publicKey,
+              service: requestData?.service,
+            });
             return true; // Success
           }
-  
+
           addNodeByPath(
             undefined,
             {
               type: "file",
               name: filename,
+              displayName: filename,
               mimeType: file?.type,
               sizeInBytes: file?.size,
               qortalName: myName,
               identifier: constructedIdentifier,
               service: requestData?.service,
+              ...(sharingKey ? { sharingKey } : {}),
+              ...(accountPublicKey ? { publicKey: accountPublicKey } : {}),
             },
             undefined
           );
-  
+
+          await recordPrivateIndexEntry({
+            indexOwner: accountAddress || myName,
+            identifier: constructedIdentifier,
+            filename,
+            mimeType: file?.type,
+            sizeInBytes: file?.size,
+            encryptionType: "private",
+            sharingKey,
+            publicKey: accountPublicKey || publicKey,
+            service: requestData?.service,
+          });
+
             
           return true; // Success
         } else {
@@ -240,8 +438,9 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
   
         const constructedIdentifier =
           existingFile?.identifier || `q-manager-858-${uid.rnd()}`;
-        const account = await qortalRequest({
+        const account = await requestQortal({
           action: "PUBLISH_QDN_RESOURCE",
+          name: myName,
           service: existingFile?.service || requestData?.service,
           identifier: constructedIdentifier,
           file,
@@ -252,6 +451,8 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
           if (!!existingFile) {
             updateByPath({
               ...existingFile,
+              name: filename,
+              displayName: filename,
               mimeType: file?.type,
               sizeInBytes: file?.size,
             });
@@ -264,6 +465,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, mode, existingFile
             {
               type: "file",
               name: filename,
+              displayName: filename,
               mimeType: file?.type,
               sizeInBytes: file?.size,
               qortalName: myName,

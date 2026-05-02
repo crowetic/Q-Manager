@@ -2,11 +2,9 @@ import { useState } from "react";
 import { Highlight, themes } from "prism-react-renderer";
 import { Typography, Box, useTheme } from "@mui/material";
 import { CodeWrapper, DisplayCodeResponsePre } from "./Common-styles";
+import React from "react";
 
-export const DisplayCodeResponse = ({
-  codeBlock,
-  language = "javascript"
-}) => {
+export const DisplayCodeResponse = ({ codeBlock, language = "javascript" }) => {
   const theme = useTheme();
 
   const [copyText, setCopyText] = useState("Copy");
@@ -14,9 +12,7 @@ export const DisplayCodeResponse = ({
   return (
     <CodeWrapper>
       <Highlight
-        theme={
-         themes.palenight 
-        }
+        theme={themes.palenight}
         code={codeBlock}
         language="javascript"
       >
@@ -33,7 +29,7 @@ export const DisplayCodeResponse = ({
                 color: theme.palette.text.primary,
                 borderTopRightRadius: "7px",
                 borderTopLeftRadius: "7px",
-                marginBottom: "10px"
+                marginBottom: "10px",
               }}
             >
               <Typography>RESPONSE</Typography>
@@ -51,7 +47,7 @@ export const DisplayCodeResponse = ({
                     userSelect: "none",
                     opacity: "0.5",
                     marginRight: "8px",
-                    fontSize: "16px"
+                    fontSize: "16px",
                   }}
                 >
                   {i + 1}

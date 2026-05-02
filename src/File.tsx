@@ -18,6 +18,7 @@ import {
 } from "@mui/material";
 import { styled } from "@mui/system";
 import { Transition } from "./ShowAction";
+import type { TransitionProps } from "@mui/material/transitions/transition";
 import CloseIcon from "@mui/icons-material/Close";
 import { Label, PUBLISH_QDN_RESOURCE } from "./actions/PUBLISH_QDN_RESOURCE";
 import { base64ToUint8Array, uint8ArrayToObject } from "./utils";
@@ -26,8 +27,61 @@ import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import { Spacer } from "./components/Spacer";
 import WarningIcon from "@mui/icons-material/Warning";
 import { openToast } from "./components/openToast";
+import { requestQortal } from "./qapp/request";
 
-const getDisplayName = (file) => file?.displayName || file?.name || "";
+const isEncryptedFileNode = (file) => {
+  const service =
+    typeof file?.service === "string" ? file.service.toUpperCase() : "";
+  const encryptionType =
+    typeof file?.encryptionType === "string"
+      ? file.encryptionType.toLowerCase()
+      : "";
+  const identifier =
+    typeof file?.identifier === "string" ? file.identifier.toLowerCase() : "";
+
+  return (
+    Boolean(file?.group || file?.groupId) ||
+    encryptionType.includes("private") ||
+    encryptionType.includes("group") ||
+    service.includes("_PRIVATE") ||
+    identifier.startsWith("p-") ||
+    identifier.startsWith("pvt-") ||
+    identifier.startsWith("grp-")
+  );
+};
+
+const isGenericPrivateResourceLabel = (value) => {
+  const normalized =
+    typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!normalized) return true;
+  return (
+    normalized === "data" ||
+    normalized === "file" ||
+    normalized === "blob" ||
+    normalized === "resource" ||
+    normalized === "preview" ||
+    normalized === "unknown" ||
+    normalized === "untitled" ||
+    normalized === "data.bin" ||
+    normalized.startsWith("data.")
+  );
+};
+
+const getDisplayName = (file) =>
+  isEncryptedFileNode(file)
+    ? (() => {
+        const name = typeof file?.name === "string" ? file.name : "";
+        const displayName =
+          typeof file?.displayName === "string" ? file.displayName : "";
+        if (displayName && !isGenericPrivateResourceLabel(displayName)) {
+          return displayName;
+        }
+        if (name && !isGenericPrivateResourceLabel(name)) {
+          return name;
+        }
+        return displayName || name || "";
+      })()
+    : file?.displayName || file?.name || "";
 
 const getFileSizeBytes = (file) => {
   const candidates = [
@@ -64,13 +118,19 @@ export const SelectedFile = ({
   selectedFile,
   setSelectedFile,
   updateByPath,
+  myName,
+  accountAddress,
+  accountPublicKey,
   mode,
   groups,
-  selectedGroup
+  selectedGroup,
+  addNodeByPath,
 }) => {
-  const [selectedType, setSelectedType] = useState(0);
+  const [selectedType, setSelectedType] = useState<string | number>(0);
   const [isExpandMore, setIsExpandMore] = useState(false);
-  const [customFileName, setCustomFileName] = useState(getDisplayName(selectedFile))
+  const [customFileName, setCustomFileName] = useState(
+    getDisplayName(selectedFile)
+  );
   const fileSizeBytes = getFileSizeBytes(selectedFile);
   useEffect(() => {
     if (selectedFile?.mimeType?.toLowerCase()?.includes("image")) {
@@ -81,25 +141,18 @@ export const SelectedFile = ({
   }, [selectedFile?.mimeType]);
   useEffect(() => {
     setCustomFileName(getDisplayName(selectedFile));
-  }, [selectedFile?.identifier, selectedFile?.service]);
+  }, [
+    selectedFile?.identifier,
+    selectedFile?.service,
+    selectedFile?.displayName,
+    selectedFile?.name,
+    selectedFile?.filename,
+  ]);
   const createEmbedLink = async () => {
-   
-    const promise = (async ()=> {
+    const promise = (async () => {
       try {
         if (mode === "public") {
-          await qortalRequest({
-            action: "CREATE_AND_COPY_EMBED_LINK",
-            type: selectedType,
-            name: selectedFile.qortalName,
-            identifier: selectedFile.identifier,
-            service: selectedFile.service,
-            mimeType: selectedFile?.mimeType,
-            fileName: customFileName
-          });
-          return;
-        }
-        if (mode === "group") {
-          await qortalRequest({
+          await requestQortal({
             action: "CREATE_AND_COPY_EMBED_LINK",
             type: selectedType,
             name: selectedFile.qortalName,
@@ -107,38 +160,85 @@ export const SelectedFile = ({
             service: selectedFile.service,
             mimeType: selectedFile?.mimeType,
             fileName: customFileName,
-            encryptionType: 'group',
           });
           return;
         }
-        const res = await fetch(
-          `/arbitrary/${selectedFile.service}/${selectedFile.qortalName}/${selectedFile.identifier}?encoding=base64`
-        );
-        const base64Data = await res.text();
-        const decryptedData = await qortalRequest({
-          action: "DECRYPT_DATA",
-          encryptedData: base64Data,
-        });
-        const decryptToUnit8Array = base64ToUint8Array(decryptedData);
-        const responseData = uint8ArrayToObject(decryptToUnit8Array);
-        if (!responseData?.key)
+        if (mode === "group") {
+          await requestQortal({
+            action: "CREATE_AND_COPY_EMBED_LINK",
+            type: selectedType,
+            name: selectedFile.qortalName,
+            identifier: selectedFile.identifier,
+            service: selectedFile.service,
+            mimeType: selectedFile?.mimeType,
+            fileName: customFileName,
+            encryptionType: "group",
+          });
+          return;
+        }
+        const resourcePropertyPayloads = [
+          {
+            action: "GET_QDN_RESOURCE_PROPERTIES",
+            service: selectedFile.service,
+            identifier: selectedFile.identifier,
+            name: selectedFile.qortalName,
+          },
+          {
+            action: "GET_QDN_RESOURCE_PROPERTIES",
+            service: selectedFile.service,
+            identifier: selectedFile.identifier,
+            qortalName: selectedFile.qortalName,
+          },
+          {
+            action: "GET_QDN_RESOURCE_PROPERTIES",
+            service: selectedFile.service,
+            identifier: selectedFile.identifier,
+          },
+        ];
+
+        let responseData: any = null;
+        for (const payload of resourcePropertyPayloads) {
+          try {
+            const response = await requestQortal(payload);
+            if (response && typeof response === "object") {
+              responseData = response;
+              if (responseData?.key || responseData?.sharingKey) break;
+            }
+          } catch (error) {}
+        }
+
+        if (!responseData?.key && !responseData?.sharingKey) {
+          const res = await fetch(
+            `/arbitrary/${selectedFile.service}/${selectedFile.qortalName}/${selectedFile.identifier}?encoding=base64`
+          );
+          const base64Data = await res.text();
+          const decryptedData = await requestQortal({
+            action: "DECRYPT_DATA",
+            encryptedData: base64Data,
+          });
+          const decryptToUnit8Array = base64ToUint8Array(decryptedData);
+          responseData = uint8ArrayToObject(decryptToUnit8Array);
+        }
+
+        const resolvedKey = responseData?.key || responseData?.sharingKey;
+        if (!resolvedKey)
           throw new Error("Could not find key in encrypted data");
-        await qortalRequest({
+        await requestQortal({
           action: "CREATE_AND_COPY_EMBED_LINK",
           type: selectedType,
           name: selectedFile.qortalName,
           identifier: selectedFile.identifier,
           service: selectedFile.service,
-          encryptionType: 'private',
-          key: responseData.key,
+          encryptionType: "private",
+          key: resolvedKey,
           mimeType: selectedFile?.mimeType,
-          fileName: customFileName
+          fileName: customFileName,
         });
-        return true
+        return true;
       } catch (error) {
-       throw error
+        throw error;
       }
-    })()
+    })();
     await openToast(promise, {
       loading: "Downloading resource and fetching link... please wait.",
       success: "Copied successfully!",
@@ -151,7 +251,11 @@ export const SelectedFile = ({
         fullScreen
         open={!!selectedFile}
         onClose={() => setSelectedFile(null)}
-        TransitionComponent={Transition}
+        TransitionComponent={
+          Transition as React.ComponentType<
+            TransitionProps & { children: React.ReactElement }
+          >
+        }
         PaperProps={{
           style: {
             backgroundColor: "rgb(39, 40, 44)",
@@ -226,7 +330,7 @@ export const SelectedFile = ({
               <MenuItem value="ATTACHMENT">ATTACHMENT</MenuItem>
             </Select>
           </Box>
-        
+
           <Button
             onClick={createEmbedLink}
             disabled={!selectedType}
@@ -238,13 +342,13 @@ export const SelectedFile = ({
         <Spacer height="10px" />
 
         <Box
-            sx={{
-              display: "flex",
-              flexDirection: "column",
-              gap: "5px",
-              padding: '8px'
-            }}
-          >
+          sx={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "5px",
+            padding: "8px",
+          }}
+        >
           <Label>Filename to show</Label>
           <input
             type="text"
@@ -255,69 +359,73 @@ export const SelectedFile = ({
               setCustomFileName(e.target.value);
             }}
             style={{
-              background: 'transparent',
-              color: 'white',
-              maxWidth: '100%'
+              background: "transparent",
+              color: "white",
+              maxWidth: "100%",
             }}
           />
           <Typography sx={{ fontSize: "13px", opacity: 0.82 }}>
-            Size: {fileSizeBytes === null ? "Unknown" : formatBytes(fileSizeBytes)}
+            Size:{" "}
+            {fileSizeBytes === null ? "Unknown" : formatBytes(fileSizeBytes)}
           </Typography>
-            <Spacer height="10px" />
-        {mode === 'private' && (
-            <Box
-            sx={{
-              width: "100%",
-              display: "flex",
-              gap: "20px",
-              alignItems: "center",
-            }}
-          >
-            <WarningIcon
-              sx={{
-                color: "#ff9800",
-              }}
-            />
-            <Typography>
-              Encrypted resource! Be careful where you paste this link.
-            </Typography>
-          </Box>
-        )}
-      
-        <Spacer height="20px" />
-
-        <Box>
-          <ButtonBase onClick={() => setIsExpandMore((prev) => !prev)}>
+          <Spacer height="10px" />
+          {mode === "private" && (
             <Box
               sx={{
-                padding: "10px",
+                width: "100%",
                 display: "flex",
                 gap: "20px",
                 alignItems: "center",
               }}
             >
-              <Typography>Edit publish</Typography>
-
-              {isExpandMore ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+              <WarningIcon
+                sx={{
+                  color: "#ff9800",
+                }}
+              />
+              <Typography>
+                Encrypted resource! Be careful where you paste this link.
+              </Typography>
             </Box>
-          </ButtonBase>
-          <Spacer height="40px" />
-          <Box
-            sx={{
-              display: isExpandMore ? "block" : "none",
-            }}
-          >
-            <PUBLISH_QDN_RESOURCE
-              existingFile={selectedFile}
-              updateByPath={updateByPath}
-              mode={mode}
-              groups={groups}
-              selectedGroup={selectedGroup}
-            />
+          )}
+
+          <Spacer height="20px" />
+
+          <Box>
+            <ButtonBase onClick={() => setIsExpandMore((prev) => !prev)}>
+              <Box
+                sx={{
+                  padding: "10px",
+                  display: "flex",
+                  gap: "20px",
+                  alignItems: "center",
+                }}
+              >
+                <Typography>Edit publish</Typography>
+
+                {isExpandMore ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+              </Box>
+            </ButtonBase>
+            <Spacer height="40px" />
+            <Box
+              sx={{
+                display: isExpandMore ? "block" : "none",
+              }}
+            >
+              <PUBLISH_QDN_RESOURCE
+                existingFile={selectedFile}
+                myName={myName}
+                accountAddress={accountAddress}
+                accountPublicKey={accountPublicKey}
+                updateByPath={updateByPath}
+                mode={mode}
+                groups={groups}
+                selectedGroup={selectedGroup}
+                addNodeByPath={addNodeByPath}
+              />
+            </Box>
           </Box>
         </Box>
-          </Box>
-      
       </Dialog>
     </div>
   );

@@ -9,13 +9,95 @@ import {
   styled,
 } from "@mui/material";
 import ShortUniqueId from "short-unique-id";
-import { fileToBase64 } from "../utils";
+import { fileToBase64, objectToBase64 } from "../utils";
 import { openToast } from "../components/openToast";
 import Button from "../components/Button";
 import { privateServices, services } from "../constants";
 import { useDropzone } from "react-dropzone"; 
+import { requestQortal } from "../qapp/request";
+import { upsertPrivateResourceIndexEntry } from "../storage";
 
 const uid = new ShortUniqueId({ length: 10 });
+
+const normalizeEncryptedSharingKeyResponse = (response) => {
+  if (response === null || response === undefined) {
+    return {
+      data64: "",
+      sharingKey: "",
+      publicKey: "",
+    };
+  }
+
+  if (typeof response === "string") {
+    const trimmed = response.trim();
+    if (!trimmed) {
+      return {
+        data64: "",
+        sharingKey: "",
+        publicKey: "",
+      };
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object") {
+        return {
+          data64:
+            parsed?.data64 ||
+            parsed?.data ||
+            parsed?.encryptedData ||
+            parsed?.payload ||
+            "",
+          sharingKey: parsed?.key || parsed?.sharingKey || "",
+          publicKey: parsed?.publicKey || "",
+          raw: parsed,
+        };
+      }
+    } catch (error) {}
+
+    return {
+      data64: trimmed,
+      sharingKey: "",
+      publicKey: "",
+      raw: response,
+    };
+  }
+
+  if (typeof response === "object") {
+    return {
+      data64:
+        response?.data64 ||
+        response?.data ||
+        response?.encryptedData ||
+        response?.payload ||
+        "",
+      sharingKey: response?.key || response?.sharingKey || "",
+      publicKey: response?.publicKey || "",
+      raw: response,
+    };
+  }
+
+  return {
+    data64: String(response),
+    sharingKey: "",
+    publicKey: "",
+    raw: response,
+  };
+};
+
+const buildEncryptedResourcePayload = async ({ data64, filename, file }) => {
+  return objectToBase64({
+    qManagerEncryptedResource: true,
+    version: 1,
+    data: data64,
+    metadata: {
+      filename,
+      displayName: filename,
+      mimeType: file?.type || "application/octet-stream",
+      sizeInBytes: Number(file?.size) || 0,
+    },
+  });
+};
 
 export const Label = styled("label")`
   font-family: 'IBM Plex Sans', sans-serif;
@@ -29,6 +111,8 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
   files: initialFiles = [],
   addNodeByPath,
   myName,
+  accountAddress,
+  accountPublicKey,
   mode,
   groups,
   selectedGroup,
@@ -60,14 +144,16 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
       .replace(/\s+/g, "_")
       .slice(0, 20) || "untitled";
     const filename = ext ? `${title}.${ext}` : title;
-    const base = title.toLowerCase();
     const prefix =
       mode === "public"
         ? "pub"
         : mode === "private"
         ? "pvt"
         : `grp-${selectedGroup}`;
-    const identifier = `${prefix}-q-manager-${base}`;
+    const identifier =
+      mode === "public"
+        ? `${prefix}-q-manager-${title.toLowerCase()}`
+        : `${prefix}-q-manager-${uid.rnd()}`;
     return { filename, identifier };
   };
 
@@ -80,83 +166,92 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
 
       // 1) build resources array
       const resources = [];
-      const localMetaByIdentifier = new Map();
+      const publishedItems = [];
       for (const file of files) {
         const { filename, identifier } = makeMeta(file);
         const data64 = await fileToBase64(file);
-        localMetaByIdentifier.set(identifier, {
+        const mimeType = file?.type || "application/octet-stream";
+        const sizeInBytes = Number(file?.size) || 0;
+        const publishedItem = {
+          file,
           filename,
-          mimeType: file?.type || "application/octet-stream",
-          sizeInBytes: Number(file?.size) || 0,
-        });
+          identifier,
+          mimeType,
+          sizeInBytes,
+        };
+        publishedItems.push(publishedItem);
 
         if (mode === "group") {
           // group‐encrypt
-          const encrypted = await qortalRequest({
-            action: "ENCRYPT_QORTAL_GROUP_DATA",
+          const encryptedPayload = await buildEncryptedResourcePayload({
             data64,
+            filename,
+            file,
+          });
+          const encrypted = await requestQortal({
+            action: "ENCRYPT_QORTAL_GROUP_DATA",
+            data64: encryptedPayload,
             groupId: selectedGroup,
           });
           resources.push({
+            name: myName,
             service: requestData.service,
             identifier,
-            filename,
-            mimeType: file.type,
+            mimeType,
             data64: encrypted,
             externalEncrypt: true,
           });
         } else if (mode === "private") {
           // private‐encrypt
-          const encrypted = await qortalRequest({
-            action: "ENCRYPT_DATA_WITH_SHARING_KEY",
+          const encryptedPayload = await buildEncryptedResourcePayload({
             data64,
+            filename,
+            file,
           });
+          const encryptedResponse = await requestQortal({
+            action: "ENCRYPT_DATA_WITH_SHARING_KEY",
+            data64: encryptedPayload,
+          });
+          const {
+            data64: encrypted,
+            sharingKey,
+            publicKey,
+          } = normalizeEncryptedSharingKeyResponse(encryptedResponse);
           resources.push({
+            name: myName,
             service: requestData.service,
             identifier,
-            filename,
-            mimeType: file.type,
+            mimeType,
             data64: encrypted,
           });
+          publishedItem.sharingKey = sharingKey;
+          publishedItem.publicKey = accountPublicKey || publicKey;
         } else {
           // public
           resources.push({
+            name: myName,
             service: requestData.service,
             identifier,
             filename,
-            mimeType: file.type,
+            mimeType,
             file, // raw File object
           });
         }
       }
 
       // 2) send multi-publish request
-      const result = await qortalRequest({
+      const result = await requestQortal({
         action: "PUBLISH_MULTIPLE_QDN_RESOURCES",
         resources,
       });
 
+      if (!result || result?.error) {
+        throw new Error(result?.error || "Unable to publish the files");
+      }
+
       // 3) update tree exactly like single publish
-      for (const res of Array.isArray(result) ? result : [result]) {
-        const { identifier, service, filename, mimeType } = res;
-        const normalizedService =
-          (typeof service === "string" && service) ||
-          (typeof service?.name === "string" && service.name) ||
-          requestData.service;
-        const localMeta = localMetaByIdentifier.get(identifier) || {};
-        const resolvedFilename = filename || localMeta?.filename || identifier;
-        const resolvedMimeType =
-          mimeType || localMeta?.mimeType || "application/octet-stream";
-        const resolvedSizeValue =
-          res?.sizeInBytes ??
-          res?.size ??
-          res?.dataSize ??
-          res?.createdSize ??
-          res?.totalSize ??
-          localMeta?.sizeInBytes;
-        const parsedSize = Number(resolvedSizeValue);
-        const sizeInBytes =
-          Number.isFinite(parsedSize) && parsedSize >= 0 ? parsedSize : undefined;
+      const indexOwner = accountAddress || myName;
+      for (const item of publishedItems) {
         const groupEntry =
           mode === "group"
             ? {
@@ -167,14 +262,45 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
 
         addNodeByPath(undefined, {
           type: "file",
-          name: resolvedFilename,
-          mimeType: resolvedMimeType,
-          ...(sizeInBytes !== undefined ? { sizeInBytes } : {}),
+          name: item.filename,
+          displayName: item.filename,
+          mimeType: item.mimeType,
+          ...(item.sizeInBytes !== undefined ? { sizeInBytes: item.sizeInBytes } : {}),
           qortalName: myName,
-          identifier,
-          service: normalizedService,
+          identifier: item.identifier,
+          service: requestData.service,
+          ...(item.sharingKey ? { sharingKey: item.sharingKey } : {}),
+          ...(item.publicKey ? { publicKey: item.publicKey } : {}),
           ...groupEntry,
         });
+
+        if (mode !== "public") {
+          await upsertPrivateResourceIndexEntry(indexOwner, {
+            resourceKey: [
+              accountAddress || myName || indexOwner || "",
+              requestData.service || "",
+              item.identifier || "",
+              selectedGroup || 0,
+            ].join("|"),
+            qortalName: myName,
+            service: requestData.service,
+            identifier: item.identifier,
+            filename: item.filename,
+            displayName: item.filename,
+            mimeType: item.mimeType,
+            sizeInBytes: item.sizeInBytes,
+            encryptionType: mode === "group" ? "group" : "private",
+            ...(item.sharingKey ? { sharingKey: item.sharingKey } : {}),
+            ...(item.publicKey ? { publicKey: item.publicKey } : {}),
+            ...(mode === "group"
+              ? {
+                  group: selectedGroup,
+                  groupId: selectedGroup,
+                  groupName: groups?.find((g) => g.groupId === selectedGroup)?.groupName,
+                }
+              : {}),
+          });
+        }
       }
 
       setFiles([]); // clear selection

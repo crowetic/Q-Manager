@@ -1,10 +1,6 @@
+import React from "react";
 
-export const QortalSVG = ({
-  color,
-  height,
-  width,
-  className
-}) => {
+export const QortalSVG = ({ color, height, width, className }) => {
   return (
     <svg
       className={className}

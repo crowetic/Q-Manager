@@ -6,6 +6,7 @@ import { DisplayCodeResponse } from "../components/DisplayCodeResponse";
 import beautify from "js-beautify";
 import Button from "../components/Button";
 import { OptionsManager } from "../components/OptionsManager";
+import { requestQortal } from "../qapp/request";
 
 export const Label = styled("label")(
   ({ theme }) => `
@@ -74,7 +75,7 @@ await qortalRequest({
   const executeQortalRequest = async () => {
     try {
       setIsLoading(true)
-      let account = await qortalRequest({
+      let account = await requestQortal({
         action: "CREATE_POLL",
         pollName: requestData?.pollName,
   pollDescription: requestData?.pollDescription,

@@ -5,11 +5,15 @@ import {
   uint8ArrayToObject,
 } from "./utils";
 import { privateServices, services } from "./constants";
+import { requestQortal } from "./qapp/request";
 
 const DB_NAME = "FileSystemDB";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = "fileSystemQManager";
+const PRIVATE_RESOURCE_INDEX_STORE = "privateResourceIndex";
 const LOCAL_STORAGE_PREFIX = "q-manager-filesystem-v1";
+const PRIVATE_INDEX_LOCAL_STORAGE_PREFIX = "q-manager-private-index-v1";
+const PRIVATE_INDEX_LOCAL_MAX_BYTES = Math.floor(4.75 * 1024 * 1024);
 
 const QDN_STRUCTURE_IDENTIFIER = "q-manager-filesystem-v1";
 const QDN_STRUCTURE_FILENAME = "q-manager-filesystem-v1.txt";
@@ -28,12 +32,31 @@ const isValidFileSystemQManager = (data) => {
   );
 };
 
+const QDN_FILESYSTEM_IDENTIFIER = "q-manager-filesystem-v1";
+
+export const getQdnFileSystemIdentifier = () => QDN_FILESYSTEM_IDENTIFIER;
+
+const isValidPrivateResourceIndex = (data) => {
+  return (
+    data &&
+    typeof data === "object" &&
+    typeof data.entries === "object" &&
+    data.entries !== null
+  );
+};
+
 const getNow = () => Date.now();
 
 const toStorageRecord = (fileSystemQManager, updatedAt = getNow()) => ({
   version: STORAGE_RECORD_VERSION,
   updatedAt,
   data: fileSystemQManager,
+});
+
+const toPrivateIndexRecord = (privateResourceIndex, updatedAt = getNow()) => ({
+  version: 1,
+  updatedAt,
+  data: privateResourceIndex,
 });
 
 const parseFileSystemRecord = (raw) => {
@@ -56,6 +79,67 @@ const parseFileSystemRecord = (raw) => {
   return null;
 };
 
+const parsePrivateIndexRecord = (raw) => {
+  if (!raw || typeof raw !== "object") return null;
+
+  if (isValidPrivateResourceIndex(raw?.data)) {
+    return {
+      data: raw.data,
+      updatedAt: Number(raw.updatedAt) || 0,
+    };
+  }
+
+  if (isValidPrivateResourceIndex(raw)) {
+    return {
+      data: raw,
+      updatedAt: Number(raw.updatedAt || raw._updatedAt) || 0,
+    };
+  }
+
+  return null;
+};
+
+const getResourceField = (resource, keys) => {
+  for (const key of keys) {
+    if (resource?.[key] !== undefined && resource?.[key] !== null) {
+      return resource[key];
+    }
+  }
+  return undefined;
+};
+
+const buildResourcePropertyPayloads = (resource) => {
+  const basePayload = {
+    action: "GET_QDN_RESOURCE_PROPERTIES",
+    service: resource?.service,
+    identifier: resource?.identifier,
+  };
+  const ownerName = resource?.qortalName || resource?.name;
+  if (!ownerName) return [basePayload];
+  return [
+    { ...basePayload, name: ownerName },
+    { ...basePayload, qortalName: ownerName },
+    basePayload,
+  ];
+};
+
+export const fetchQdnResourceProperties = async (resource) => {
+  if (!resource?.service || !resource?.identifier) return null;
+  if (typeof requestQortal !== "function") return null;
+
+  const payloads = buildResourcePropertyPayloads(resource);
+
+  for (const payload of payloads) {
+    try {
+      const response = await requestQortal(payload);
+      if (response === undefined || response === null) continue;
+      return response;
+    } catch (error) {}
+  }
+
+  return null;
+};
+
 const initializeDB = () => {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -64,6 +148,9 @@ const initializeDB = () => {
       const db = event.target.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: "address" });
+      }
+      if (!db.objectStoreNames.contains(PRIVATE_RESOURCE_INDEX_STORE)) {
+        db.createObjectStore(PRIVATE_RESOURCE_INDEX_STORE, { keyPath: "name" });
       }
     };
 
@@ -199,6 +286,247 @@ export const saveFileSystemQManagerEverywhere = async (
   };
 };
 
+const getPrivateIndexLocalStorageKey = (name) =>
+  `${PRIVATE_INDEX_LOCAL_STORAGE_PREFIX}:${name}`;
+
+const getPrivateIndexRecordFromLocalStorage = (name, fallbackNames = []) => {
+  const lookupNames = [name, ...(Array.isArray(fallbackNames) ? fallbackNames : [])].filter(
+    Boolean
+  );
+  if (lookupNames.length === 0) return null;
+
+  for (const lookupName of lookupNames) {
+    try {
+      const key = getPrivateIndexLocalStorageKey(lookupName);
+      const stored = localStorage.getItem(key);
+      if (!stored) continue;
+      const parsed = JSON.parse(stored);
+      const record = parsePrivateIndexRecord(parsed);
+      if (record) return record;
+    } catch (error) {
+      console.error("Error reading private index from localStorage:", error);
+    }
+  }
+
+  return null;
+};
+
+export const getPrivateResourceIndexFromLocalStorage = (name, fallbackNames = []) => {
+  const record = getPrivateIndexRecordFromLocalStorage(name, fallbackNames);
+  return record?.data || null;
+};
+
+const savePrivateIndexToLocalStorage = (
+  privateResourceIndex,
+  name,
+  updatedAt = getNow()
+) => {
+  if (!name) return;
+
+  try {
+    const serialized = JSON.stringify(
+      toPrivateIndexRecord(privateResourceIndex, updatedAt)
+    );
+    if (serialized.length > PRIVATE_INDEX_LOCAL_MAX_BYTES) {
+      localStorage.removeItem(getPrivateIndexLocalStorageKey(name));
+      return;
+    }
+    localStorage.setItem(getPrivateIndexLocalStorageKey(name), serialized);
+  } catch (error) {
+    console.error("Error saving private index to localStorage:", error);
+  }
+};
+
+export const savePrivateResourceIndexToDB = async (
+  privateResourceIndex,
+  name,
+  updatedAt = getNow()
+) => {
+  if (!name) throw new Error("Name is required to save private index.");
+
+  try {
+    const db = await initializeDB();
+    const transaction = db.transaction(PRIVATE_RESOURCE_INDEX_STORE, "readwrite");
+    const store = transaction.objectStore(PRIVATE_RESOURCE_INDEX_STORE);
+
+    store.put({
+      name,
+      ...toPrivateIndexRecord(privateResourceIndex, updatedAt),
+    });
+
+    return new Promise((resolve) => {
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+    });
+  } catch (error) {
+    console.error("Error saving private index to IndexedDB:", error);
+    return false;
+  }
+};
+
+const getPrivateIndexRecordFromDB = async (name, fallbackNames = []) => {
+  const lookupNames = [name, ...(Array.isArray(fallbackNames) ? fallbackNames : [])].filter(
+    Boolean
+  );
+  if (lookupNames.length === 0) return null;
+
+  try {
+    const db = await initializeDB();
+
+    for (const lookupName of lookupNames) {
+      const transaction = db.transaction(PRIVATE_RESOURCE_INDEX_STORE, "readonly");
+      const store = transaction.objectStore(PRIVATE_RESOURCE_INDEX_STORE);
+      const record = await new Promise((resolve, reject) => {
+        const request = store.get(lookupName);
+
+        request.onsuccess = (event) => {
+          if (event.target.result) {
+            resolve(parsePrivateIndexRecord(event.target.result));
+          } else {
+            resolve(null);
+          }
+        };
+        request.onerror = (event) => reject(event.target.error);
+      });
+
+      if (record) return record;
+    }
+  } catch (error) {
+    console.error("Error retrieving private index from IndexedDB:", error);
+    return null;
+  }
+
+  return null;
+};
+
+export const getPrivateResourceIndexFromDB = async (name, fallbackNames = []) => {
+  const record = await getPrivateIndexRecordFromDB(name, fallbackNames);
+  return record?.data || null;
+};
+
+export const savePrivateResourceIndexEverywhere = async (
+  privateResourceIndex,
+  name
+) => {
+  if (!name) throw new Error("Name is required to save private index.");
+  const updatedAt = getNow();
+
+  const dbSaved = await savePrivateResourceIndexToDB(
+    privateResourceIndex,
+    name,
+    updatedAt
+  );
+
+  if (dbSaved) {
+    savePrivateIndexToLocalStorage(privateResourceIndex, name, updatedAt);
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(
+        new CustomEvent("q-manager-private-index-changed", {
+          detail: { name, updatedAt, source: "indexeddb" },
+        })
+      );
+    }
+    return {
+      updatedAt,
+      primary: "indexeddb",
+      fallbackUsed: false,
+    };
+  }
+
+  savePrivateIndexToLocalStorage(privateResourceIndex, name, updatedAt);
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(
+      new CustomEvent("q-manager-private-index-changed", {
+        detail: { name, updatedAt, source: "localstorage" },
+      })
+    );
+  }
+  return {
+    updatedAt,
+    primary: "localstorage",
+    fallbackUsed: true,
+  };
+};
+
+export const getPersistedPrivateResourceIndex = async (name, fallbackNames = []) => {
+  if (!name) return null;
+
+  const dbRecord = await getPrivateIndexRecordFromDB(name, fallbackNames);
+  const localRecord = getPrivateIndexRecordFromLocalStorage(name, fallbackNames);
+
+  if (dbRecord?.data && localRecord?.data) {
+    const dbUpdatedAt = Number(dbRecord.updatedAt) || 0;
+    const localUpdatedAt = Number(localRecord.updatedAt) || 0;
+
+    if (localUpdatedAt > dbUpdatedAt) {
+      await savePrivateResourceIndexToDB(
+        localRecord.data,
+        name,
+        localUpdatedAt || getNow()
+      );
+      return localRecord.data;
+    }
+
+    savePrivateIndexToLocalStorage(dbRecord.data, name, dbUpdatedAt || getNow());
+    return dbRecord.data;
+  }
+
+  if (dbRecord?.data) {
+    const synchronizedAt = Number(dbRecord.updatedAt) || getNow();
+    savePrivateIndexToLocalStorage(dbRecord.data, name, synchronizedAt);
+    return dbRecord.data;
+  }
+
+  if (localRecord?.data) {
+    const synchronizedAt = Number(localRecord.updatedAt) || getNow();
+    await savePrivateResourceIndexToDB(localRecord.data, name, synchronizedAt);
+    return localRecord.data;
+  }
+
+  return null;
+};
+
+export const upsertPrivateResourceIndexEntry = async (name, entry) => {
+  if (!name) throw new Error("Name is required to update private index.");
+  if (!entry || typeof entry !== "object") return null;
+
+  const existingIndex =
+    (await getPersistedPrivateResourceIndex(name)) || { entries: {} };
+  const nextEntries = { ...(existingIndex.entries || {}) };
+  const key =
+    entry.resourceKey ||
+    entry.entryKey ||
+    entry.key ||
+    [
+      entry?.qortalName || name,
+      entry?.service || "",
+      entry?.identifier || "",
+      entry?.group || entry?.groupId || 0,
+    ].join("|");
+
+  nextEntries[key] = {
+    ...(nextEntries[key] || {}),
+    ...entry,
+    key,
+    updatedAt: getNow(),
+  };
+
+  const nextIndex = {
+    version: 1,
+    updatedAt: getNow(),
+    entries: nextEntries,
+  };
+
+  await savePrivateResourceIndexEverywhere(nextIndex, name);
+  return nextIndex;
+};
+
+export const getPrivateResourceIndexEntry = async (name, resourceKey) => {
+  if (!name || !resourceKey) return null;
+  const index = await getPersistedPrivateResourceIndex(name);
+  return index?.entries?.[resourceKey] || null;
+};
+
 export const getPersistedFileSystemQManager = async (address) => {
   if (!address) return null;
 
@@ -249,13 +577,31 @@ export const getPersistedFileSystemQManager = async (address) => {
 
 export const publishFileSystemQManagerToQDN = async ({
   fileSystemQManager,
+  privateResourceIndex,
+  activePublishName,
 }) => {
   if (!fileSystemQManager) {
     throw new Error("No filesystem data available to publish");
   }
+  if (!activePublishName) {
+    throw new Error("Qortal name is required to publish filesystem");
+  }
 
-  const plainData64 = await objectToBase64(fileSystemQManager);
-  const encryptedData = await qortalRequest({
+  // Always include the private index in the QDN backup so another node can
+  // load the complete local state (filesystem + private index) from QDN.
+  const payload = {
+    version: 1,
+    publishedAt: getNow(),
+    publishedBy: activePublishName,
+    fileSystem: {
+      public: fileSystemQManager.public,
+      private: fileSystemQManager.private,
+      group: fileSystemQManager.group || {},
+    },
+    privateResourceIndex: privateResourceIndex || { entries: {} },
+  };
+  const plainData64 = await objectToBase64(payload);
+  const encryptedData = await requestQortal({
     action: "ENCRYPT_DATA",
     data64: plainData64,
   });
@@ -264,7 +610,7 @@ export const publishFileSystemQManagerToQDN = async ({
     throw new Error("Failed to encrypt filesystem data");
   }
 
-  return qortalRequest({
+  return requestQortal({
     action: "PUBLISH_QDN_RESOURCE",
     service: "DOCUMENT_PRIVATE",
     identifier: QDN_STRUCTURE_IDENTIFIER,
@@ -291,7 +637,7 @@ export const importFileSystemQManagerFromQDN = async (name) => {
     throw new Error("No filesystem data found in QDN resource");
   }
 
-  const decryptedData = await qortalRequest({
+  const decryptedData = await requestQortal({
     action: "DECRYPT_DATA",
     encryptedData,
   });
@@ -302,11 +648,32 @@ export const importFileSystemQManagerFromQDN = async (name) => {
 
   const decryptedBytes = base64ToUint8Array(decryptedData);
   const parsed = uint8ArrayToObject(decryptedBytes);
-  if (!isValidFileSystemQManager(parsed)) {
+  if (!parsed || typeof parsed !== "object") {
     throw new Error("QDN filesystem data is invalid");
   }
 
-  return parsed;
+  // Handle both new v1 structure (filesystem + private index) and legacy structure
+  if (parsed?.fileSystem) {
+    return {
+      public: parsed.fileSystem.public,
+      private: parsed.fileSystem.private,
+      group: parsed.fileSystem.group || {},
+      ...(parsed?.privateResourceIndex ? { privateResourceIndex: parsed.privateResourceIndex } : {}),
+      _publishedAt: parsed.publishedAt,
+      _publishedBy: parsed.publishedBy,
+    };
+  }
+
+  // Legacy format - directly has public/private/group
+  if (isValidFileSystemQManager(parsed)) {
+    return {
+      public: parsed.public,
+      private: parsed.private,
+      group: parsed.group || {},
+    };
+  }
+
+  throw new Error("QDN filesystem data is invalid");
 };
 
 const normalizeResourceList = (payload) => {
@@ -325,15 +692,6 @@ const fetchResourcesFromEndpoint = async (url) => {
   } catch (error) {
     return [];
   }
-};
-
-const getResourceField = (resource, keys) => {
-  for (const key of keys) {
-    if (resource?.[key] !== undefined && resource?.[key] !== null) {
-      return resource[key];
-    }
-  }
-  return undefined;
 };
 
 const isDeleteTombstoneResource = (resource) => {
@@ -377,6 +735,11 @@ const normalizeDiscoveredResource = (resource, ownerName) => {
     "contentType",
     "mediaType",
   ]);
+  const encryptionType = getResourceField(resource, [
+    "encryptionType",
+    "encryption",
+    "type",
+  ]);
   const groupId = getResourceField(resource, ["groupId", "group", "groupid"]);
   const rawSize = getResourceField(resource, [
     "sizeInBytes",
@@ -399,42 +762,23 @@ const normalizeDiscoveredResource = (resource, ownerName) => {
     service,
     qortalName,
     mimeType: mimeType || "application/octet-stream",
+    ...(encryptionType ? { encryptionType } : {}),
     groupId: Number(groupId) || 0,
     ...(sizeInBytes !== undefined ? { sizeInBytes } : {}),
   };
 };
 
-const buildGetResourcePropertiesPayloads = (resource) => {
-  const basePayload = {
-    action: "GET_QDN_RESOURCE_PROPERTIES",
-    service: resource?.service,
-    identifier: resource?.identifier,
-  };
-  const ownerName = resource?.qortalName || resource?.name;
-  if (!ownerName) return [basePayload];
-  return [
-    { ...basePayload, name: ownerName },
-    { ...basePayload, qortalName: ownerName },
-    basePayload,
-  ];
-};
-
 const hydrateDiscoveredResourceFromProperties = async (resource) => {
   if (!resource?.service || !resource?.identifier) return resource;
-  if (resource?.filename) return resource;
-  if (typeof qortalRequest !== "function") return resource;
-
-  const payloads = buildGetResourcePropertiesPayloads(resource);
-  let properties = null;
-
-  for (const payload of payloads) {
-    try {
-      const response = await qortalRequest(payload);
-      if (response === undefined || response === null) continue;
-      properties = response;
-      break;
-    } catch (error) {}
+  if (
+    resource?.filename &&
+    resource?.mimeType &&
+    resource?.sizeInBytes !== undefined &&
+    resource?.encryptionType
+  ) {
+    return resource;
   }
+  const properties = await fetchQdnResourceProperties(resource);
 
   if (!properties || typeof properties !== "object") return resource;
 
@@ -444,6 +788,11 @@ const hydrateDiscoveredResourceFromProperties = async (resource) => {
     "mime",
     "contentType",
     "mediaType",
+  ]);
+  const encryptionType = getResourceField(properties, [
+    "encryptionType",
+    "encryption",
+    "type",
   ]);
   const rawSize = getResourceField(properties, [
     "sizeInBytes",
@@ -471,6 +820,9 @@ const hydrateDiscoveredResourceFromProperties = async (resource) => {
   }
   if (sizeInBytes !== undefined && next.sizeInBytes === undefined) {
     next.sizeInBytes = sizeInBytes;
+  }
+  if (encryptionType && !next.encryptionType) {
+    next.encryptionType = encryptionType;
   }
 
   return next;

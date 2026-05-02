@@ -22,6 +22,7 @@ import {
   ButtonBase,
   Avatar,
   Box,
+  Badge,
   Typography,
   Dialog,
   DialogTitle,
@@ -39,6 +40,7 @@ import {
   MenuItem,
   Checkbox,
   FormControlLabel,
+  Tooltip,
 } from "@mui/material";
 import { styled } from "@mui/system";
 import { useDropzone } from "react-dropzone";
@@ -48,10 +50,14 @@ import { ContextMenuPinnedFiles } from "./ContextMenuPinnedFiles";
 import { useModal } from "./useModal";
 import {
   discoverQManagerResourcesByName,
+  fetchQdnResourceProperties,
   getPersistedFileSystemQManager,
+  getPersistedPrivateResourceIndex,
   importFileSystemQManagerFromQDN,
   publishFileSystemQManagerToQDN,
   saveFileSystemQManagerEverywhere,
+  savePrivateResourceIndexEverywhere,
+  upsertPrivateResourceIndexEntry,
 } from "./storage";
 import { SelectedFile } from "./File";
 import { FileSystemBreadcrumbs } from "./FileSystemBreadcrumbs";
@@ -61,6 +67,7 @@ import AttachFileIcon from "@mui/icons-material/AttachFile";
 import CreateNewFolderIcon from "@mui/icons-material/CreateNewFolder";
 import InsertDriveFileIcon from "@mui/icons-material/InsertDriveFile";
 import PushPinIcon from "@mui/icons-material/PushPin";
+import NotificationsActiveOutlinedIcon from "@mui/icons-material/NotificationsActiveOutlined";
 import {
   base64ToUint8Array,
   handleImportClick,
@@ -68,6 +75,7 @@ import {
   uint8ArrayToObject,
 } from "./utils";
 import { openToast } from "./components/openToast";
+import { requestQortal } from "./qapp/request";
 const initialFileSystem = [
   {
     type: "folder",
@@ -79,6 +87,8 @@ const initialFileSystem = [
 const initialGroupFileSystem = {};
 const RECOVERED_IMPORTS_FOLDER = "Recovered Imports";
 const SHOW_THUMBNAILS_KEY = "q-manager-show-thumbnails";
+const SHOW_PRIVATE_THUMBNAILS_KEY = "q-manager-show-private-thumbnails";
+const AUTO_QDN_FILESYSTEM_SYNC_KEY = "q-manager-auto-qdn-filesystem-sync";
 const MAX_TEXT_PREVIEW_CHARS = 120000;
 
 const TEXT_PREVIEW_EXTENSIONS = new Set([
@@ -151,6 +161,766 @@ const getResourcePreviewUrl = (file) => {
   )}/${encodeURIComponent(file.identifier)}`;
 };
 
+const isEncryptedResource = (file) => {
+  const service = safeUpper(getServiceName(file));
+  const identifier = safeLower(file?.identifier);
+  const encryptionType = safeLower(file?.encryptionType);
+  return (
+    Boolean(file?.group || file?.groupId) ||
+    encryptionType.includes("private") ||
+    encryptionType.includes("group") ||
+    service.includes("_PRIVATE") ||
+    identifier.startsWith("p-") ||
+    identifier.startsWith("pvt-") ||
+    identifier.startsWith("grp-")
+  );
+};
+
+const isGenericPrivateResourceLabel = (value) => {
+  const normalized = safeLower(value).trim();
+  if (!normalized) return true;
+  return (
+    normalized === "data" ||
+    normalized === "file" ||
+    normalized === "blob" ||
+    normalized === "resource" ||
+    normalized === "preview" ||
+    normalized === "unknown" ||
+    normalized === "untitled" ||
+    normalized === "data.bin" ||
+    normalized.startsWith("data.")
+  );
+};
+
+const parseBase64Json = (value) => {
+  if (!value || typeof value !== "string") return null;
+  try {
+    const decodedText = new TextDecoder("utf-8", { fatal: false }).decode(
+      base64ToUint8Array(value)
+    );
+    return JSON.parse(decodedText);
+  } catch (error) {}
+  return null;
+};
+
+const extractBase64FromDataUrl = (value) => {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  const match = trimmed.match(/^data:[^;]+;base64,(.+)$/is);
+  return match?.[1]?.trim() || "";
+};
+
+const parseJsonLikeString = (value) => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch (error) {}
+  return parseBase64Json(trimmed);
+};
+
+const tryDecodeTextFromBase64 = (value) => {
+  if (typeof value !== "string") return "";
+  try {
+    return new TextDecoder("utf-8", { fatal: false }).decode(
+      base64ToUint8Array(value)
+    );
+  } catch (error) {
+    return "";
+  }
+};
+
+const isProbablyTextContent = (value) => {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+
+  let printableCount = 0;
+  for (const char of trimmed) {
+    const code = char.charCodeAt(0);
+    if (
+      code === 9 ||
+      code === 10 ||
+      code === 13 ||
+      (code >= 32 && code <= 126)
+    ) {
+      printableCount++;
+    }
+  }
+
+  return printableCount / trimmed.length >= 0.8;
+};
+
+const unwrapDecryptedPayload = (value, depth = 0) => {
+  if (depth > 4) {
+    return {
+      data64: typeof value === "string" ? value.trim() : "",
+      metadata: {},
+    };
+  }
+
+  if (value && typeof value === "object") {
+    const nextValue =
+      typeof value?.data === "string"
+        ? value.data
+        : typeof value?.data64 === "string"
+          ? value.data64
+          : typeof value?.content === "string"
+            ? value.content
+            : typeof value?.base64 === "string"
+              ? value.base64
+              : typeof value?.fileData === "string"
+                ? value.fileData
+                : "";
+    const metadata =
+      value?.metadata && typeof value.metadata === "object"
+        ? value.metadata
+        : {};
+
+    if (!nextValue) {
+      return {
+        data64: "",
+        metadata,
+      };
+    }
+
+    const nested = unwrapDecryptedPayload(nextValue, depth + 1);
+    return {
+      data64: nested.data64,
+      metadata: {
+        ...metadata,
+        ...(nested.metadata || {}),
+      },
+    };
+  }
+
+  const rawValue = typeof value === "string" ? value.trim() : "";
+  if (!rawValue) {
+    return {
+      data64: "",
+      metadata: {},
+    };
+  }
+
+  const dataUrlBase64 = extractBase64FromDataUrl(rawValue);
+  if (dataUrlBase64) {
+    return unwrapDecryptedPayload(dataUrlBase64, depth + 1);
+  }
+
+  const jsonLike = parseJsonLikeString(rawValue);
+  if (jsonLike && typeof jsonLike === "object") {
+    return unwrapDecryptedPayload(jsonLike, depth + 1);
+  }
+
+  const decodedText = tryDecodeTextFromBase64(rawValue).trim();
+  if (decodedText) {
+    const nestedDataUrlBase64 = extractBase64FromDataUrl(decodedText);
+    if (nestedDataUrlBase64) {
+      return unwrapDecryptedPayload(nestedDataUrlBase64, depth + 1);
+    }
+
+    const nestedJsonLike = parseJsonLikeString(decodedText);
+    if (nestedJsonLike && typeof nestedJsonLike === "object") {
+      return unwrapDecryptedPayload(nestedJsonLike, depth + 1);
+    }
+  }
+
+  return {
+    data64: rawValue,
+    metadata: {},
+  };
+};
+
+const normalizeDecryptedPayload = (value) => unwrapDecryptedPayload(value);
+
+const base64ToBlob = (base64, mimeType = "application/octet-stream") => {
+  const bytes = base64ToUint8Array(base64);
+  return new Blob([bytes], { type: mimeType || "application/octet-stream" });
+};
+
+const decodeBase64Utf8 = (encodedText) => {
+  const bytes = base64ToUint8Array(encodedText);
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+};
+
+const trimForTextPreview = (textValue) => {
+  const fullText = textValue || "";
+  if (fullText.length <= MAX_TEXT_PREVIEW_CHARS) {
+    return fullText;
+  }
+  return `${fullText.slice(
+    0,
+    MAX_TEXT_PREVIEW_CHARS
+  )}\n\n[Preview truncated to ${MAX_TEXT_PREVIEW_CHARS.toLocaleString()} characters]`;
+};
+
+const inferMimeTypeFromBase64 = (base64) => {
+  try {
+    const bytes = base64ToUint8Array(base64).slice(0, 24);
+    if (
+      bytes[0] === 0x89 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x4e &&
+      bytes[3] === 0x47
+    ) {
+      return "image/png";
+    }
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+      return "image/jpeg";
+    }
+    if (
+      bytes[0] === 0x47 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x38
+    ) {
+      return "image/gif";
+    }
+    if (
+      bytes[0] === 0x52 &&
+      bytes[1] === 0x49 &&
+      bytes[2] === 0x46 &&
+      bytes[3] === 0x46 &&
+      bytes[8] === 0x57 &&
+      bytes[9] === 0x45 &&
+      bytes[10] === 0x42 &&
+      bytes[11] === 0x50
+    ) {
+      return "image/webp";
+    }
+    if (
+      bytes[0] === 0x25 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x44 &&
+      bytes[3] === 0x46
+    ) {
+      return "application/pdf";
+    }
+  } catch (error) {}
+  return "";
+};
+
+const inferPreviewKindFromMimeType = (mimeType) => {
+  const normalized = safeLower(mimeType);
+  if (normalized.startsWith("image/")) return "image";
+  if (normalized.startsWith("video/")) return "video";
+  if (normalized.startsWith("audio/")) return "audio";
+  if (isTextLikeMimeType(normalized)) return "text";
+  return "";
+};
+
+const fetchResourcePropertiesForPreview = async (resource) =>
+  fetchQdnResourceProperties(resource);
+
+const getPreviewPropertyValue = (source, keys = []) => {
+  if (!source || typeof source !== "object") return undefined;
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) {
+      return source[key];
+    }
+  }
+  return undefined;
+};
+
+const findPrivateIndexEntry = (privateResourceIndex, file) => {
+  const entries =
+    privateResourceIndex?.entries &&
+    typeof privateResourceIndex.entries === "object"
+      ? privateResourceIndex.entries
+      : null;
+  if (!entries) return null;
+
+  const service = getServiceName(file);
+  const identifier = file?.identifier;
+  const groupId = file?.group || file?.groupId || 0;
+  const qortalName = file?.qortalName || file?.name || "";
+  const candidateKeys = new Set([
+    file?.resourceKey,
+    file?.entryKey,
+    file?.key,
+    [qortalName, service, identifier, groupId].join("|"),
+    [qortalName, service, identifier, 0].join("|"),
+    [service, identifier, groupId].join("|"),
+    [service, identifier, 0].join("|"),
+  ]);
+
+  for (const candidateKey of candidateKeys) {
+    if (candidateKey && entries[candidateKey]) {
+      return entries[candidateKey];
+    }
+  }
+
+  const matchingEntries = Object.values(entries).filter((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    const entryService = getServiceName(entry);
+    const entryIdentifier = entry?.identifier;
+    const entryGroupId = entry?.group || entry?.groupId || 0;
+    return (
+      entryService === service &&
+      entryIdentifier === identifier &&
+      Number(entryGroupId || 0) === Number(groupId || 0)
+    );
+  });
+
+  if (matchingEntries.length === 0) return null;
+  if (!qortalName) return matchingEntries[0] || null;
+
+  const exactNameMatch = matchingEntries.find((entry) => {
+    const entryName = entry?.qortalName || entry?.name || "";
+    return entryName && entryName === qortalName;
+  });
+
+  return exactNameMatch || matchingEntries[0] || null;
+};
+
+const resolvePrivateResourceItem = (item, privateResourceIndex) => {
+  if (!item || item.type !== "file") return item;
+
+  const encrypted = isEncryptedResource(item);
+  const privateIndexEntry = findPrivateIndexEntry(privateResourceIndex, item);
+  if (!encrypted && !privateIndexEntry) return item;
+
+  const sizeCandidates = [
+    privateIndexEntry?.sizeInBytes,
+    item?.sizeInBytes,
+    item?.size,
+    item?.fileSize,
+    item?.dataSize,
+    item?.createdSize,
+    item?.totalSize,
+  ];
+  let resolvedSize = null;
+  for (const candidate of sizeCandidates) {
+    const numericValue = Number(candidate);
+    if (Number.isFinite(numericValue) && numericValue >= 0) {
+      resolvedSize = numericValue;
+      break;
+    }
+  }
+
+  const resolvedDisplayName =
+    privateIndexEntry?.displayName ||
+    privateIndexEntry?.filename ||
+    item?.displayName ||
+    item?.name ||
+    item?.filename ||
+    "";
+
+  const resolvedFilename =
+    privateIndexEntry?.filename ||
+    resolvedDisplayName ||
+    item?.name ||
+    item?.filename ||
+    "";
+
+  return {
+    ...item,
+    ...(resolvedDisplayName ? { displayName: resolvedDisplayName } : {}),
+    ...(resolvedFilename ? { filename: resolvedFilename } : {}),
+    ...(privateIndexEntry?.mimeType
+      ? { mimeType: privateIndexEntry.mimeType }
+      : {}),
+    ...(resolvedSize !== null ? { sizeInBytes: resolvedSize } : {}),
+    ...(privateIndexEntry?.encryptionType || item?.encryptionType
+      ? {
+          encryptionType:
+            privateIndexEntry?.encryptionType || item?.encryptionType,
+        }
+      : {}),
+    ...(privateIndexEntry?.sharingKey || item?.sharingKey || item?.key
+      ? {
+          sharingKey:
+            privateIndexEntry?.sharingKey || item?.sharingKey || item?.key,
+        }
+      : {}),
+    ...(privateIndexEntry?.key ? { key: privateIndexEntry.key } : {}),
+    ...(privateIndexEntry?.publicKey || item?.publicKey
+      ? { publicKey: privateIndexEntry?.publicKey || item?.publicKey }
+      : {}),
+    ...(privateIndexEntry?.group !== undefined ||
+    privateIndexEntry?.groupId !== undefined ||
+    item?.group !== undefined ||
+    item?.groupId !== undefined
+      ? {
+          group:
+            privateIndexEntry?.group ??
+            privateIndexEntry?.groupId ??
+            item?.group ??
+            item?.groupId,
+          groupId:
+            privateIndexEntry?.groupId ??
+            privateIndexEntry?.group ??
+            item?.groupId ??
+            item?.group,
+        }
+      : {}),
+  };
+};
+
+const sanitizePreviewMetadata = (metadata) => {
+  if (!metadata || typeof metadata !== "object") return {};
+  const safe = {};
+  const filename = getPreviewPropertyValue(metadata, [
+    "filename",
+    "fileName",
+    "displayName",
+    "name",
+  ]);
+  const mimeType = getPreviewPropertyValue(metadata, [
+    "mimeType",
+    "mime",
+    "contentType",
+    "mediaType",
+  ]);
+  const sizeInBytes = getPreviewPropertyValue(metadata, [
+    "sizeInBytes",
+    "size",
+    "dataSize",
+    "createdSize",
+    "totalSize",
+  ]);
+  const title = getPreviewPropertyValue(metadata, ["title"]);
+  const groupId = getPreviewPropertyValue(metadata, ["groupId", "group"]);
+  const encryptionType = getPreviewPropertyValue(metadata, [
+    "encryptionType",
+    "encryption",
+  ]);
+  const previewKind = getPreviewPropertyValue(metadata, ["previewKind"]);
+
+  if (filename) safe.filename = filename;
+  if (filename && !safe.displayName) safe.displayName = filename;
+  if (mimeType) safe.mimeType = mimeType;
+  if (title) safe.title = title;
+  if (sizeInBytes !== undefined && sizeInBytes !== null) {
+    const parsedSize = Number(sizeInBytes);
+    if (Number.isFinite(parsedSize) && parsedSize >= 0) {
+      safe.sizeInBytes = parsedSize;
+    }
+  }
+  if (groupId !== undefined && groupId !== null) {
+    const parsedGroupId = Number(groupId);
+    if (Number.isFinite(parsedGroupId)) {
+      safe.groupId = parsedGroupId;
+    }
+  }
+  if (encryptionType) safe.encryptionType = encryptionType;
+  if (previewKind) safe.previewKind = previewKind;
+  return safe;
+};
+
+const buildPreviewHints = (file, properties, privateIndexEntry) => {
+  const mimeType = getPreviewPropertyValue(file, ["mimeType"]);
+  const propertyMimeType = getPreviewPropertyValue(properties, [
+    "mimeType",
+    "mime",
+    "contentType",
+    "mediaType",
+  ]);
+  const indexMimeType = getPreviewPropertyValue(privateIndexEntry, [
+    "mimeType",
+  ]);
+  const filename = getFileNameForInference(file);
+  const propertyFilename = getPreviewPropertyValue(properties, [
+    "filename",
+    "fileName",
+    "displayName",
+    "name",
+  ]);
+  const indexFilename = getPreviewPropertyValue(privateIndexEntry, [
+    "filename",
+    "displayName",
+    "name",
+  ]);
+  const encryptionType =
+    getPreviewPropertyValue(file, ["encryptionType"]) ||
+    getPreviewPropertyValue(properties, ["encryptionType", "encryption"]) ||
+    getPreviewPropertyValue(privateIndexEntry, ["encryptionType"]);
+  const sharingKey =
+    getPreviewPropertyValue(file, ["sharingKey", "key"]) ||
+    getPreviewPropertyValue(properties, ["sharingKey", "key"]) ||
+    getPreviewPropertyValue(privateIndexEntry, ["sharingKey", "key"]);
+  const publicKey =
+    getPreviewPropertyValue(file, ["publicKey"]) ||
+    getPreviewPropertyValue(properties, ["publicKey"]) ||
+    getPreviewPropertyValue(privateIndexEntry, ["publicKey"]);
+  const groupId =
+    getPreviewPropertyValue(file, ["groupId", "group"]) ||
+    getPreviewPropertyValue(properties, ["groupId", "group"]) ||
+    getPreviewPropertyValue(privateIndexEntry, ["groupId", "group"]);
+
+  const encrypted = isEncryptedResource(file);
+  const resolvedMimeType = encrypted
+    ? indexMimeType || mimeType || propertyMimeType || ""
+    : mimeType || propertyMimeType || indexMimeType || "";
+  const resolvedFilename = encrypted
+    ? indexFilename || filename || propertyFilename || ""
+    : filename || propertyFilename || indexFilename || "";
+
+  return {
+    mimeType: resolvedMimeType,
+    filename: resolvedFilename,
+    displayName: resolvedFilename,
+    encryptionType: encryptionType || "",
+    sharingKey: sharingKey || "",
+    publicKey: publicKey || "",
+    groupId: Number(groupId) || 0,
+    previewKind:
+      inferPreviewKindFromMimeType(resolvedMimeType) ||
+      inferPreviewKindFromMimeType(propertyMimeType) ||
+      inferPreviewKindFromMimeType(indexMimeType) ||
+      "",
+  };
+};
+
+const cachePrivatePreviewHints = async (
+  file,
+  accountAddress,
+  hints,
+  privateIndexEntry = null
+) => {
+  if (!accountAddress || !isEncryptedResource(file)) return;
+  if (!hints || typeof hints !== "object") return;
+
+  const filenameCandidates = [
+    hints?.filename,
+    hints?.displayName,
+    file?.name,
+    file?.filename,
+    file?.displayName,
+    privateIndexEntry?.filename,
+    privateIndexEntry?.displayName,
+  ].filter((candidate) => typeof candidate === "string" && candidate.trim());
+  const resolvedFilename =
+    filenameCandidates.find(
+      (candidate) => !isGenericPrivateResourceLabel(candidate)
+    ) || "";
+  const resolvedSizeInBytes = (() => {
+    const candidate = hints?.sizeInBytes ?? privateIndexEntry?.sizeInBytes;
+    const parsed = Number(candidate);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+  })();
+
+  const hasCacheableHint =
+    Boolean(hints?.mimeType) ||
+    Boolean(resolvedFilename) ||
+    Boolean(hints?.encryptionType) ||
+    Boolean(hints?.sharingKey) ||
+    Boolean(hints?.publicKey) ||
+    resolvedSizeInBytes !== undefined;
+
+  if (!hasCacheableHint) return;
+
+  try {
+    await upsertPrivateResourceIndexEntry(accountAddress, {
+      resourceKey: [
+        file?.qortalName || "",
+        getServiceName(file) || "",
+        file?.identifier || "",
+        file?.group || file?.groupId || 0,
+      ].join("|"),
+      qortalName: file?.qortalName || "",
+      service: getServiceName(file),
+      identifier: file?.identifier,
+      ...(resolvedFilename ? { filename: resolvedFilename } : {}),
+      ...(resolvedFilename ? { displayName: resolvedFilename } : {}),
+      mimeType: hints?.mimeType || file?.mimeType || "application/octet-stream",
+      ...(resolvedSizeInBytes !== undefined
+        ? { sizeInBytes: resolvedSizeInBytes }
+        : {}),
+      encryptionType: hints?.encryptionType || file?.encryptionType || "",
+      ...(hints?.groupId
+        ? { group: hints.groupId, groupId: hints.groupId }
+        : {}),
+      ...(hints?.sharingKey ? { sharingKey: hints.sharingKey } : {}),
+      ...(hints?.publicKey ? { publicKey: hints.publicKey } : {}),
+    });
+  } catch (error) {}
+};
+
+const fetchResourceBase64 = async (file, signal) => {
+  const previewUrl = getResourcePreviewUrl(file);
+  if (!previewUrl) throw new Error("Preview unavailable for this file");
+  const response = await fetch(`${previewUrl}?encoding=base64`, { signal });
+  if (!response.ok) {
+    throw new Error(`Could not fetch resource (${response.status})`);
+  }
+  return response.text();
+};
+
+const isUsableDecryptedPayload = (
+  candidate,
+  sourceData64,
+  expectedKind = "",
+  expectedMimeType = ""
+) => {
+  const normalized = normalizeDecryptedPayload(candidate?.data64 || candidate);
+  const trimmed = normalized.data64?.trim();
+  if (!trimmed) return false;
+  if (trimmed === sourceData64?.trim()) return false;
+
+  try {
+    base64ToUint8Array(trimmed);
+  } catch (error) {
+    return false;
+  }
+
+  const detectedMimeType =
+    normalized?.metadata?.mimeType ||
+    inferMimeTypeFromBase64(trimmed) ||
+    expectedMimeType ||
+    "";
+  const detectedKind =
+    inferPreviewKindFromMimeType(detectedMimeType) ||
+    inferPreviewKindFromMimeType(expectedMimeType) ||
+    "";
+
+  if (expectedKind && expectedKind !== "unknown") {
+    if (expectedKind === "text") {
+      return isProbablyTextContent(tryDecodeTextFromBase64(trimmed));
+    }
+    return detectedKind === expectedKind;
+  }
+
+  return Boolean(detectedKind || detectedMimeType);
+};
+
+const decryptResourcePayload = async (
+  file,
+  encryptedData,
+  hints = {},
+  accountPublicKey = ""
+) => {
+  const groupId = file?.group || file?.groupId || hints?.groupId;
+  const sharingKey = file?.sharingKey || file?.key || hints?.sharingKey;
+  const publicKey = file?.publicKey || hints?.publicKey || accountPublicKey;
+  const expectedKind =
+    hints?.previewKind || inferPreviewKindFromMimeType(hints?.mimeType) || "";
+  const expectedMimeType = hints?.mimeType || "";
+
+  const attempts = [];
+  if (groupId) {
+    attempts.push({
+      action: "DECRYPT_QORTAL_GROUP_DATA",
+      data64: encryptedData,
+      groupId,
+    });
+  }
+
+  attempts.push({
+    action: "DECRYPT_DATA_WITH_SHARING_KEY",
+    encryptedData,
+    data64: encryptedData,
+    ...(sharingKey ? { key: sharingKey } : {}),
+    ...(publicKey ? { publicKey } : {}),
+  });
+
+  attempts.push({
+    action: "DECRYPT_DATA",
+    encryptedData,
+    data64: encryptedData,
+    ...(publicKey ? { publicKey } : {}),
+  });
+
+  for (const attempt of attempts) {
+    try {
+      const candidate = normalizeDecryptedPayload(await requestQortal(attempt));
+      if (
+        !isUsableDecryptedPayload(
+          candidate,
+          encryptedData,
+          expectedKind,
+          expectedMimeType
+        )
+      ) {
+        continue;
+      }
+      return candidate;
+    } catch (error) {}
+  }
+
+  throw new Error("Could not decrypt preview");
+};
+
+const fetchPreviewPayload = async (
+  file,
+  signal,
+  accountAddress,
+  accountPublicKey = ""
+) => {
+  const data = await fetchResourceBase64(file, signal);
+  if (!isEncryptedResource(file)) {
+    return {
+      data64: data,
+      metadata: {},
+    };
+  }
+
+  const properties = await fetchResourcePropertiesForPreview(file);
+  const privateIndex = accountAddress
+    ? await getPersistedPrivateResourceIndex(
+        accountAddress,
+        [file?.qortalName, file?.name].filter(Boolean)
+      )
+    : null;
+  const privateIndexEntry = findPrivateIndexEntry(privateIndex, file);
+  const hints = buildPreviewHints(file, properties, privateIndexEntry);
+  await cachePrivatePreviewHints(
+    file,
+    accountAddress,
+    hints,
+    privateIndexEntry
+  );
+
+  const expectedKind =
+    hints?.previewKind || inferPreviewKindFromMimeType(hints?.mimeType);
+  const rawCandidate = normalizeDecryptedPayload(data);
+  if (
+    isUsableDecryptedPayload(rawCandidate, data, expectedKind, hints?.mimeType)
+  ) {
+    const rawPayload = {
+      data64: rawCandidate.data64,
+      metadata: sanitizePreviewMetadata({
+        ...hints,
+        ...(rawCandidate.metadata || {}),
+      }),
+    };
+    await cachePrivatePreviewHints(
+      file,
+      accountAddress,
+      {
+        ...hints,
+        ...(rawPayload.metadata || {}),
+      },
+      privateIndexEntry
+    );
+    return rawPayload;
+  }
+
+  const decrypted = await decryptResourcePayload(
+    file,
+    data,
+    hints,
+    accountPublicKey
+  );
+  await cachePrivatePreviewHints(
+    file,
+    accountAddress,
+    {
+      ...hints,
+      ...(decrypted.metadata || {}),
+    },
+    privateIndexEntry
+  );
+  return {
+    data64: decrypted.data64,
+    metadata: sanitizePreviewMetadata({
+      ...hints,
+      ...(decrypted.metadata || {}),
+    }),
+  };
+};
+
 const safeLower = (value) => {
   if (typeof value === "string") return value.toLowerCase();
   if (value === undefined || value === null) return "";
@@ -172,17 +942,38 @@ const safeUpper = (value) => {
 };
 
 const getFileNameForInference = (file) => {
-  const candidates = [
-    file?.filename,
-    file?.displayName,
-    file?.name,
-    file?.title,
-    file?.fetchedResourceProperties?.filename,
-  ];
+  const encrypted = isEncryptedResource(file);
+  const candidates = encrypted
+    ? [
+        file?.name,
+        file?.displayName,
+        file?.filename,
+        file?.title,
+        file?.fetchedResourceProperties?.filename,
+      ]
+    : [
+        file?.filename,
+        file?.displayName,
+        file?.name,
+        file?.title,
+        file?.fetchedResourceProperties?.filename,
+      ];
   for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) {
+    if (
+      typeof candidate === "string" &&
+      candidate.trim() &&
+      (!encrypted || !isGenericPrivateResourceLabel(candidate))
+    ) {
       return candidate;
     }
+  }
+  if (encrypted) {
+    const fallbackCandidate = [
+      file?.displayName,
+      file?.filename,
+      file?.name,
+    ].find((candidate) => typeof candidate === "string" && candidate.trim());
+    if (fallbackCandidate) return fallbackCandidate;
   }
   return "";
 };
@@ -278,7 +1069,10 @@ const inferPreviewKind = (file) => {
   if (effectiveMime.startsWith("image/")) return "image";
   if (effectiveMime.startsWith("video/")) return "video";
   if (effectiveMime.startsWith("audio/")) return "audio";
-  if (isTextLikeMimeType(effectiveMime) || TEXT_PREVIEW_EXTENSIONS.has(extension))
+  if (
+    isTextLikeMimeType(effectiveMime) ||
+    TEXT_PREVIEW_EXTENSIONS.has(extension)
+  )
     return "text";
 
   if (
@@ -288,10 +1082,16 @@ const inferPreviewKind = (file) => {
   ) {
     return "image";
   }
-  if (service.includes("VIDEO") || /\.(mp4|webm|m4v|mov|mkv|avi)$/i.test(name)) {
+  if (
+    service.includes("VIDEO") ||
+    /\.(mp4|webm|m4v|mov|mkv|avi)$/i.test(name)
+  ) {
     return "video";
   }
-  if (service.includes("AUDIO") || /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(name)) {
+  if (
+    service.includes("AUDIO") ||
+    /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(name)
+  ) {
     return "audio";
   }
 
@@ -300,7 +1100,9 @@ const inferPreviewKind = (file) => {
 
 const getItemDisplayName = (item) => {
   if (!item) return "";
-  if (item.type === "file") return item.displayName || item.name || "";
+  if (item.type === "file") {
+    return getPreferredFileDisplayName(item);
+  }
   return item.name || "";
 };
 
@@ -343,77 +1145,407 @@ const getNodeSelectionKey = (item) =>
     item?.service || ""
   }|${item?.group || 0}`;
 
-const FilePreviewDialog = ({ file, onClose }) => {
+const stableStringify = (value) => {
+  if (value === undefined || typeof value === "function") return "null";
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
+
+const getPreferredFileDisplayName = (item) => {
+  const displayName =
+    typeof item?.displayName === "string" ? item.displayName : "";
+  const name = typeof item?.name === "string" ? item.name : "";
+
+  if (displayName && !isGenericPrivateResourceLabel(displayName)) {
+    return displayName;
+  }
+  if (name && !isGenericPrivateResourceLabel(name)) {
+    return name;
+  }
+  return displayName || name || "";
+};
+
+const getFileIdentity = (file) =>
+  [
+    file?.qortalName || "",
+    getServiceName(file) || "",
+    file?.identifier || "",
+    file?.group || file?.groupId || 0,
+  ].join("|");
+
+const getFileSummaryName = (file) =>
+  file?.displayName ||
+  file?.filename ||
+  file?.name ||
+  file?.identifier ||
+  "File";
+
+const collectFileSystemEntries = (tree, scope, entries = []) => {
+  const walk = (nodes, path = []) => {
+    if (!Array.isArray(nodes)) return;
+    for (const node of nodes) {
+      if (!node) continue;
+      const nextPath = [...path, node.name || ""].filter(Boolean);
+      if (node.type === "file") {
+        entries.push({
+          key: getFileIdentity(node) || `${scope}|${nextPath.join("/")}`,
+          scope,
+          label: `${scope}: ${getFileSummaryName(node)}`,
+          serialized: stableStringify(node),
+          size: getItemSizeBytes(node),
+        });
+      }
+      if (Array.isArray(node.children)) {
+        walk(node.children, nextPath);
+      }
+    }
+  };
+  walk(tree);
+  return entries;
+};
+
+const collectSnapshotEntries = (snapshot) => {
+  const entries = [];
+  collectFileSystemEntries(snapshot?.public, "public", entries);
+  collectFileSystemEntries(snapshot?.private, "private", entries);
+  const groups =
+    snapshot?.group && !Array.isArray(snapshot.group) ? snapshot.group : {};
+  for (const [groupId, tree] of Object.entries(groups)) {
+    collectFileSystemEntries(tree, `group ${groupId}`, entries);
+  }
+  return entries;
+};
+
+const collectPrivateIndexEntries = (snapshot) => {
+  const entries = [];
+  const privateIndex =
+    snapshot?.privateResourceIndex || snapshot?.privateIndex || null;
+  const rawEntries =
+    privateIndex?.entries && typeof privateIndex.entries === "object"
+      ? privateIndex.entries
+      : {};
+
+  for (const [entryKey, entry] of Object.entries(rawEntries)) {
+    if (!entry || typeof entry !== "object") continue;
+    const { updatedAt, ...meaningfulEntry } = entry;
+    const serialized = stableStringify(meaningfulEntry);
+    const label =
+      entry.displayName ||
+      entry.filename ||
+      entry.name ||
+      entry.identifier ||
+      entryKey;
+    entries.push({
+      key: entry.resourceKey || entry.key || entryKey,
+      scope: "private index",
+      label: `private index: ${label}`,
+      serialized,
+      size: serialized.length,
+    });
+  }
+
+  return entries;
+};
+
+const normalizePrivateResourceIndexForComparison = (privateIndex) => {
+  if (!privateIndex || typeof privateIndex !== "object") return null;
+  const { updatedAt, ...rest } = privateIndex;
+  const rawEntries =
+    rest.entries && typeof rest.entries === "object" ? rest.entries : {};
+  const normalizedEntries = {};
+
+  for (const [entryKey, entry] of Object.entries(rawEntries)) {
+    if (!entry || typeof entry !== "object") continue;
+    const { updatedAt: entryUpdatedAt, ...meaningfulEntry } = entry;
+    normalizedEntries[entryKey] = meaningfulEntry;
+  }
+
+  return {
+    ...rest,
+    entries: normalizedEntries,
+  };
+};
+
+const normalizeQdnSyncPayloadForComparison = (snapshot) => {
+  if (!snapshot || typeof snapshot !== "object") return snapshot;
+  return {
+    public: snapshot.public,
+    private: snapshot.private,
+    group: snapshot.group,
+    ...(snapshot?.privateResourceIndex
+      ? {
+          privateResourceIndex: normalizePrivateResourceIndexForComparison(
+            snapshot.privateResourceIndex
+          ),
+        }
+      : {}),
+  };
+};
+
+const summarizeFileSystemSnapshot = (snapshot) => {
+  const entries = collectSnapshotEntries(snapshot);
+  const totalBytes = entries.reduce(
+    (sum, entry) => sum + (Number(entry.size) || 0),
+    0
+  );
+  const groupCount =
+    snapshot?.group && !Array.isArray(snapshot.group)
+      ? Object.keys(snapshot.group).length
+      : 0;
+  return {
+    files: entries.length,
+    groups: groupCount,
+    sizeLabel: entries.some((entry) => entry.size !== null)
+      ? formatBytes(totalBytes)
+      : "Unknown",
+  };
+};
+
+const summarizePrivateIndexSnapshot = (snapshot) => {
+  const entries = collectPrivateIndexEntries(snapshot);
+  const totalBytes = entries.reduce(
+    (sum, entry) => sum + (Number(entry.size) || 0),
+    0
+  );
+
+  return {
+    entries: entries.length,
+    sizeLabel: entries.length > 0 ? formatBytes(totalBytes) : "Unknown",
+  };
+};
+
+const diffEntries = (fromEntries, toEntries) => {
+  const fromMap = new Map(fromEntries.map((entry) => [entry.key, entry]));
+  const toMap = new Map(toEntries.map((entry) => [entry.key, entry]));
+
+  const added = [];
+  const removed = [];
+  const changed = [];
+
+  for (const entry of toEntries) {
+    const previous = fromMap.get(entry.key);
+    if (!previous) {
+      added.push(entry.label);
+      continue;
+    }
+    if (previous.serialized !== entry.serialized) {
+      changed.push(entry.label);
+    }
+  }
+
+  for (const entry of fromEntries) {
+    if (!toMap.has(entry.key)) {
+      removed.push(entry.label);
+    }
+  }
+
+  return {
+    added,
+    removed,
+    changed,
+    hasChanges: added.length > 0 || removed.length > 0 || changed.length > 0,
+  };
+};
+
+const diffFileSystemSnapshots = (fromSnapshot, toSnapshot) =>
+  diffEntries(
+    collectSnapshotEntries(fromSnapshot),
+    collectSnapshotEntries(toSnapshot)
+  );
+
+const diffPrivateIndexSnapshots = (fromSnapshot, toSnapshot) =>
+  diffEntries(
+    collectPrivateIndexEntries(fromSnapshot),
+    collectPrivateIndexEntries(toSnapshot)
+  );
+
+const summarizeQdnSyncPayload = (snapshot) => ({
+  fileSystem: summarizeFileSystemSnapshot(snapshot),
+  privateIndex: summarizePrivateIndexSnapshot(snapshot),
+});
+
+const diffQdnSyncPayload = (fromSnapshot, toSnapshot) => {
+  const fileSystem = diffFileSystemSnapshots(fromSnapshot, toSnapshot);
+  const privateIndex = diffPrivateIndexSnapshots(fromSnapshot, toSnapshot);
+  return {
+    fileSystem,
+    privateIndex,
+    hasChanges: fileSystem.hasChanges || privateIndex.hasChanges,
+  };
+};
+
+const formatChangeList = (items) => {
+  if (!items.length) return "None";
+  const visible = items.slice(0, 8);
+  const suffix =
+    items.length > visible.length
+      ? `, +${items.length - visible.length} more`
+      : "";
+  return `${visible.join(", ")}${suffix}`;
+};
+
+const FilePreviewDialog = ({
+  file,
+  onClose,
+  onHydrateMetadata,
+  accountAddress,
+  accountPublicKey,
+}) => {
   const previewKind = inferPreviewKind(file);
   const previewUrl = getResourcePreviewUrl(file);
+  const previewResourceKey = getFileIdentity(file);
+  const encrypted = isEncryptedResource(file);
+  const [resolvedPreviewUrl, setResolvedPreviewUrl] = useState("");
+  const [resolvedPreviewKind, setResolvedPreviewKind] = useState("");
+  const [resolvedMimeType, setResolvedMimeType] = useState("");
+  const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState(false);
+  const [previewErrorMessage, setPreviewErrorMessage] = useState("");
   const [textPreview, setTextPreview] = useState("");
   const [textPreviewLoading, setTextPreviewLoading] = useState(false);
   const [textPreviewError, setTextPreviewError] = useState("");
 
   useEffect(() => {
     setPreviewError(false);
-  }, [file?.identifier, file?.service, file?.qortalName]);
+    setPreviewErrorMessage("");
+  }, [previewResourceKey]);
 
   useEffect(() => {
     setTextPreview("");
     setTextPreviewError("");
     setTextPreviewLoading(false);
-  }, [file?.identifier, file?.service, file?.qortalName, previewKind]);
+  }, [previewResourceKey, previewKind]);
 
   useEffect(() => {
-    if (!file || previewKind !== "text" || !previewUrl) {
+    setResolvedPreviewUrl("");
+    setResolvedPreviewKind("");
+    setResolvedMimeType("");
+    setPreviewLoading(false);
+
+    if (!file || !previewUrl || !encrypted) {
+      return;
+    }
+
+    const controller = new AbortController();
+    let disposed = false;
+    let objectUrl = "";
+
+    const loadEncryptedMedia = async () => {
+      setPreviewLoading(true);
+      setPreviewError(false);
+
+      try {
+        const payload = await fetchPreviewPayload(
+          file,
+          controller.signal,
+          accountAddress,
+          accountPublicKey
+        );
+        if (disposed) return;
+        if (payload?.metadata && Object.keys(payload.metadata).length > 0) {
+          onHydrateMetadata?.(payload.metadata);
+        }
+        const payloadMimeType =
+          payload?.metadata?.mimeType ||
+          file?.mimeType ||
+          inferMimeTypeFromExtension(getFileExtension(file)) ||
+          inferMimeTypeFromBase64(payload.data64);
+        const payloadKind =
+          inferPreviewKindFromMimeType(payloadMimeType) ||
+          (previewKind !== "unknown" ? previewKind : "");
+        setResolvedMimeType(payloadMimeType);
+        setResolvedPreviewKind(payloadKind || "unknown");
+
+        if (payloadKind === "text") {
+          setTextPreview(trimForTextPreview(decodeBase64Utf8(payload.data64)));
+          return;
+        }
+
+        if (!["image", "video", "audio"].includes(payloadKind)) {
+          setPreviewError(true);
+          setPreviewErrorMessage(
+            payloadMimeType
+              ? `Could not render preview as ${payloadMimeType}.`
+              : "Could not render preview."
+          );
+          return;
+        }
+
+        objectUrl = URL.createObjectURL(
+          base64ToBlob(
+            payload.data64,
+            payloadMimeType || "application/octet-stream"
+          )
+        );
+        setResolvedPreviewUrl(objectUrl);
+      } catch (error) {
+        if (!controller.signal.aborted && !disposed) {
+          setPreviewError(true);
+          setPreviewErrorMessage(
+            error?.message || "Could not decrypt preview."
+          );
+        }
+      } finally {
+        if (!disposed) {
+          setPreviewLoading(false);
+        }
+      }
+    };
+
+    loadEncryptedMedia();
+
+    return () => {
+      disposed = true;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [previewResourceKey, encrypted, previewUrl, accountAddress]);
+
+  useEffect(() => {
+    if (!file || encrypted || previewKind !== "text" || !previewUrl) {
       return;
     }
 
     const controller = new AbortController();
     let disposed = false;
 
-    const trimForPreview = (textValue) => {
-      const fullText = textValue || "";
-      if (fullText.length <= MAX_TEXT_PREVIEW_CHARS) {
-        return fullText;
-      }
-      return `${fullText.slice(
-        0,
-        MAX_TEXT_PREVIEW_CHARS
-      )}\n\n[Preview truncated to ${MAX_TEXT_PREVIEW_CHARS.toLocaleString()} characters]`;
-    };
-
-    const decodeBase64Utf8 = (encodedText) => {
-      const binary = atob(encodedText);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-    };
-
     const fetchTextPreview = async () => {
       setTextPreviewLoading(true);
       setTextPreviewError("");
 
       try {
-        const base64Response = await fetch(`${previewUrl}?encoding=base64`, {
-          signal: controller.signal,
-        });
-        if (!base64Response.ok) {
-          throw new Error(`Base64 fetch failed (${base64Response.status})`);
+        const payload = await fetchPreviewPayload(
+          file,
+          controller.signal,
+          accountAddress,
+          accountPublicKey
+        );
+        if (payload?.metadata && Object.keys(payload.metadata).length > 0) {
+          onHydrateMetadata?.(payload.metadata);
         }
-        const base64Text = await base64Response.text();
-        const decoded = trimForPreview(decodeBase64Utf8(base64Text));
+        const decoded = trimForTextPreview(decodeBase64Utf8(payload.data64));
         if (disposed) return;
         setTextPreview(decoded);
       } catch (base64Error) {
         if (controller.signal.aborted || disposed) return;
         try {
-          const plainResponse = await fetch(previewUrl, { signal: controller.signal });
+          const plainResponse = await fetch(previewUrl, {
+            signal: controller.signal,
+          });
           if (!plainResponse.ok) {
             throw new Error(`Text fetch failed (${plainResponse.status})`);
           }
           const plainText = await plainResponse.text();
           if (disposed) return;
-          setTextPreview(trimForPreview(plainText));
+          setTextPreview(trimForTextPreview(plainText));
         } catch (plainError) {
           if (controller.signal.aborted || disposed) return;
           setTextPreviewError(
@@ -435,13 +1567,18 @@ const FilePreviewDialog = ({ file, onClose }) => {
       disposed = true;
       controller.abort();
     };
-  }, [file, previewKind, previewUrl]);
+  }, [previewResourceKey, encrypted, previewKind, previewUrl, accountAddress]);
+
+  const mediaPreviewUrl = encrypted ? resolvedPreviewUrl : previewUrl;
+  const effectivePreviewKind = encrypted
+    ? resolvedPreviewKind || previewKind
+    : previewKind;
 
   return (
     <Dialog
       open={!!file}
       onClose={onClose}
-      maxWidth='lg'
+      maxWidth="lg"
       fullWidth
       PaperProps={{
         style: {
@@ -455,54 +1592,82 @@ const FilePreviewDialog = ({ file, onClose }) => {
         {!previewUrl && (
           <Typography>Preview unavailable for this file.</Typography>
         )}
-        {!!previewUrl && previewKind === "image" && !previewError && (
-          <Box
-            component='img'
-            src={previewUrl}
-            onError={() => setPreviewError(true)}
-            sx={{
-              width: "100%",
-              maxHeight: "70vh",
-              objectFit: "contain",
-              borderRadius: "8px",
-              backgroundColor: "rgba(0,0,0,0.2)",
-            }}
-          />
+        {!!previewUrl &&
+          effectivePreviewKind === "image" &&
+          !!mediaPreviewUrl &&
+          !previewError && (
+            <Box
+              component="img"
+              src={mediaPreviewUrl}
+              onError={() => {
+                setPreviewError(true);
+                setPreviewErrorMessage("Could not render image preview.");
+              }}
+              sx={{
+                width: "100%",
+                maxHeight: "70vh",
+                objectFit: "contain",
+                borderRadius: "8px",
+                backgroundColor: "rgba(0,0,0,0.2)",
+              }}
+            />
+          )}
+        {!!previewUrl && previewLoading && (
+          <Typography sx={{ mb: "10px" }}>Decrypting preview...</Typography>
         )}
-        {!!previewUrl && previewKind === "video" && !previewError && (
-          <Box
-            component='video'
-            controls
-            preload='metadata'
-            onError={() => setPreviewError(true)}
-            src={previewUrl}
-            sx={{
-              width: "100%",
-              maxHeight: "70vh",
-              borderRadius: "8px",
-              backgroundColor: "rgba(0,0,0,0.2)",
-            }}
-          />
+        {!!previewUrl && previewError && (
+          <Typography color="error" sx={{ mb: "10px" }}>
+            {previewErrorMessage || "Could not preview this resource inline."}
+          </Typography>
         )}
-        {!!previewUrl && previewKind === "audio" && !previewError && (
-          <Box
-            component='audio'
-            controls
-            preload='metadata'
-            onError={() => setPreviewError(true)}
-            src={previewUrl}
-            sx={{ width: "100%" }}
-          />
-        )}
-        {!!previewUrl && previewKind === "text" && (
+        {!!previewUrl &&
+          effectivePreviewKind === "video" &&
+          !!mediaPreviewUrl &&
+          !previewError && (
+            <Box
+              component="video"
+              controls
+              preload="metadata"
+              onError={() => {
+                setPreviewError(true);
+                setPreviewErrorMessage("Could not render video preview.");
+              }}
+              src={mediaPreviewUrl}
+              sx={{
+                width: "100%",
+                maxHeight: "70vh",
+                borderRadius: "8px",
+                backgroundColor: "rgba(0,0,0,0.2)",
+              }}
+            />
+          )}
+        {!!previewUrl &&
+          effectivePreviewKind === "audio" &&
+          !!mediaPreviewUrl &&
+          !previewError && (
+            <Box
+              component="audio"
+              controls
+              preload="metadata"
+              onError={() => {
+                setPreviewError(true);
+                setPreviewErrorMessage("Could not render audio preview.");
+              }}
+              src={mediaPreviewUrl}
+              sx={{ width: "100%" }}
+            />
+          )}
+        {!!previewUrl && effectivePreviewKind === "text" && (
           <>
-            {textPreviewLoading && <Typography>Loading text preview...</Typography>}
+            {textPreviewLoading && (
+              <Typography>Loading text preview...</Typography>
+            )}
             {!textPreviewLoading && !!textPreviewError && (
               <Typography>{textPreviewError}</Typography>
             )}
             {!textPreviewLoading && !textPreviewError && (
               <Box
-                component='pre'
+                component="pre"
                 sx={{
                   width: "100%",
                   maxHeight: "70vh",
@@ -523,15 +1688,17 @@ const FilePreviewDialog = ({ file, onClose }) => {
           </>
         )}
         {!!previewUrl &&
-          (previewKind === "unknown" || (previewKind !== "text" && previewError)) && (
+          (effectivePreviewKind === "unknown" ||
+            (effectivePreviewKind !== "text" && previewError)) &&
+          !previewLoading && (
             <Typography>
-              Could not preview this resource inline. It may be encrypted or not a
-              supported media type.
+              Could not preview this resource inline. It may not be a supported
+              media type.
             </Typography>
           )}
       </DialogContent>
       <DialogActions>
-        <Button variant='contained' onClick={onClose}>
+        <Button variant="contained" onClick={onClose}>
           Close
         </Button>
       </DialogActions>
@@ -552,24 +1719,92 @@ const SortableItem = ({
   onToggleSelect,
   onPreview,
   showThumbnails,
+  showPrivateThumbnails,
   onHydrateMetadata,
   onTogglePin,
+  accountAddress,
+  accountPublicKey,
 }) => {
+  const sortableId = getNodeSelectionKey(item);
   const { attributes, listeners, setNodeRef, transform, transition } =
     useSortable({
-      id: item.name + item.type,
+      id: sortableId,
     });
   const clickTimeoutRef = useRef(null);
   const [thumbnailError, setThumbnailError] = useState(false);
+  const [decryptedThumbnailUrl, setDecryptedThumbnailUrl] = useState("");
+  const [thumbnailLoading, setThumbnailLoading] = useState(false);
   const previewKind = inferPreviewKind(item);
+  const encrypted = isEncryptedResource(item);
+  const shouldShowThumbnail =
+    item?.type === "file" &&
+    previewKind === "image" &&
+    (encrypted ? showPrivateThumbnails : showThumbnails);
   const thumbnailUrl =
-    showThumbnails && item?.type === "file" && previewKind === "image"
-      ? getResourcePreviewUrl(item)
-      : "";
+    shouldShowThumbnail && !encrypted ? getResourcePreviewUrl(item) : "";
 
   useEffect(() => {
     setThumbnailError(false);
-  }, [item?.identifier, item?.service, item?.qortalName, showThumbnails]);
+  }, [
+    item?.identifier,
+    item?.service,
+    item?.qortalName,
+    showThumbnails,
+    showPrivateThumbnails,
+  ]);
+
+  useEffect(() => {
+    setDecryptedThumbnailUrl("");
+    setThumbnailLoading(false);
+
+    if (!shouldShowThumbnail || !encrypted) return;
+
+    const controller = new AbortController();
+    let disposed = false;
+    let objectUrl = "";
+
+    const loadThumbnail = async () => {
+      setThumbnailLoading(true);
+      try {
+        const payload = await fetchPreviewPayload(
+          item,
+          controller.signal,
+          accountAddress,
+          accountPublicKey
+        );
+        if (disposed) return;
+        objectUrl = URL.createObjectURL(
+          base64ToBlob(
+            payload.data64,
+            payload?.metadata?.mimeType ||
+              item?.mimeType ||
+              inferMimeTypeFromExtension(getFileExtension(item))
+          )
+        );
+        setDecryptedThumbnailUrl(objectUrl);
+      } catch (error) {
+        if (!controller.signal.aborted && !disposed) {
+          setThumbnailError(true);
+        }
+      } finally {
+        if (!disposed) {
+          setThumbnailLoading(false);
+        }
+      }
+    };
+
+    loadThumbnail();
+
+    return () => {
+      disposed = true;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [item, shouldShowThumbnail, encrypted, accountAddress]);
+
+  const effectiveThumbnailUrl = encrypted
+    ? decryptedThumbnailUrl
+    : thumbnailUrl;
 
   useEffect(() => {
     return () => {
@@ -617,7 +1852,9 @@ const SortableItem = ({
             item.type === "folder"
               ? "linear-gradient(180deg, rgba(54,72,121,0.35) 0%, rgba(27,36,60,0.35) 100%)"
               : "linear-gradient(180deg, rgba(66,66,66,0.35) 0%, rgba(36,36,36,0.35) 100%)",
-          border: selected ? "2px solid #59b2ff" : "1px solid rgba(132, 162, 214, 0.35)",
+          border: selected
+            ? "2px solid #59b2ff"
+            : "1px solid rgba(132, 162, 214, 0.35)",
           boxShadow: selected
             ? "0 0 0 2px rgba(89,178,255,0.2), 0 8px 24px rgba(0,0,0,0.28)"
             : "0 8px 24px rgba(0,0,0,0.22)",
@@ -653,7 +1890,7 @@ const SortableItem = ({
         {item?.type === "file" && (
           <Checkbox
             checked={selected}
-            size='small'
+            size="small"
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
@@ -708,10 +1945,10 @@ const SortableItem = ({
           >
             {item.type === "folder" ? (
               <FolderIcon sx={{ color: "#c9ddff" }} />
-            ) : thumbnailUrl && !thumbnailError ? (
+            ) : effectiveThumbnailUrl && !thumbnailError ? (
               <Box
-                component='img'
-                src={thumbnailUrl}
+                component="img"
+                src={effectiveThumbnailUrl}
                 onError={() => setThumbnailError(true)}
                 sx={{
                   width: "100%",
@@ -747,10 +1984,77 @@ const SortableItem = ({
 export const Manager = ({ myAddress, groups }) => {
   const [fileSystemPublic, setFileSystemPublic] = useState(null);
   const [fileSystemPrivate, setFileSystemPrivate] = useState(null);
-  const [fileSystemGroup, setFileSystemGroup] = useState(initialGroupFileSystem);
+  const [fileSystemGroup, setFileSystemGroup] = useState(
+    initialGroupFileSystem
+  );
   const [selectedGroup, setSelectedGroup] = useState(null);
+  const publishNames = Array.isArray(myAddress?.names)
+    ? myAddress.names.filter((item) => item?.name)
+    : myAddress?.name?.name
+      ? [myAddress.name]
+      : [];
+  const [activePublishName, setActivePublishName] = useState(
+    myAddress?.name?.name || ""
+  );
 
   const [mode, setMode] = useState("public");
+  const [privateIndexRevision, setPrivateIndexRevision] = useState(0);
+  const [privateResourceIndex, setPrivateResourceIndex] = useState(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const handlePrivateIndexChanged = () => {
+      setPrivateIndexRevision((prev) => prev + 1);
+    };
+
+    window.addEventListener(
+      "q-manager-private-index-changed",
+      handlePrivateIndexChanged
+    );
+
+    return () => {
+      window.removeEventListener(
+        "q-manager-private-index-changed",
+        handlePrivateIndexChanged
+      );
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!myAddress?.address) {
+      setPrivateResourceIndex(null);
+      return undefined;
+    }
+
+    let disposed = false;
+    const loadPrivateResourceIndex = async () => {
+      try {
+        const loadedIndex = await getPersistedPrivateResourceIndex(
+          myAddress.address,
+          [myAddress?.name?.name, activePublishName].filter(Boolean)
+        );
+        if (!disposed) {
+          setPrivateResourceIndex(loadedIndex);
+        }
+      } catch (error) {
+        if (!disposed) {
+          setPrivateResourceIndex(null);
+        }
+      }
+    };
+
+    loadPrivateResourceIndex();
+
+    return () => {
+      disposed = true;
+    };
+  }, [
+    myAddress?.address,
+    myAddress?.name?.name,
+    activePublishName,
+    privateIndexRevision,
+  ]);
 
   const [fileSystem, setFileSystem] = useMemo(() => {
     if (mode === "public") {
@@ -793,8 +2097,32 @@ export const Manager = ({ myAddress, groups }) => {
       return false;
     }
   });
+  const [showPrivateThumbnails, setShowPrivateThumbnails] = useState(() => {
+    try {
+      return localStorage.getItem(SHOW_PRIVATE_THUMBNAILS_KEY) === "1";
+    } catch (error) {
+      return false;
+    }
+  });
+  const [autoQdnFileSystemSync, setAutoQdnFileSystemSync] = useState(() => {
+    try {
+      return localStorage.getItem(AUTO_QDN_FILESYSTEM_SYNC_KEY) !== "0";
+    } catch (error) {
+      return true;
+    }
+  });
+  const [qdnFileSystemLoadReady, setQdnFileSystemLoadReady] = useState(false);
   const [showBulkMoveModal, setShowBulkMoveModal] = useState(false);
   const [bulkMoveTargetPath, setBulkMoveTargetPath] = useState([]);
+  const [qdnSyncPrompt, setQdnSyncPrompt] = useState(null);
+  const [qdnPublishNoticeVisible, setQdnPublishNoticeVisible] = useState(false);
+  const fileSystemLoadedRef = useRef(false);
+  const skipNextQdnPublishPromptRef = useRef(true);
+  const qdnPublishPromptTimerRef = useRef(null);
+  const qdnPublishPromptRef = useRef(null);
+  const lastQdnSyncedSnapshotRef = useRef("");
+  const dismissedPublishSnapshotRef = useRef("");
+  const checkedQdnLoadRef = useRef(false);
 
   const [currentPath, setCurrentPath] = useState(["Root"]);
   const [isOpenPublish, setIsOpenPublish] = useState(false);
@@ -816,6 +2144,12 @@ export const Manager = ({ myAddress, groups }) => {
   }, [groups]);
 
   useEffect(() => {
+    if (!activePublishName && myAddress?.name?.name) {
+      setActivePublishName(myAddress.name.name);
+    }
+  }, [activePublishName, myAddress?.name?.name]);
+
+  useEffect(() => {
     setSelectedFileKeys([]);
   }, [mode, selectedGroup]);
 
@@ -824,6 +2158,39 @@ export const Manager = ({ myAddress, groups }) => {
       localStorage.setItem(SHOW_THUMBNAILS_KEY, showThumbnails ? "1" : "0");
     } catch (error) {}
   }, [showThumbnails]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        SHOW_PRIVATE_THUMBNAILS_KEY,
+        showPrivateThumbnails ? "1" : "0"
+      );
+    } catch (error) {}
+  }, [showPrivateThumbnails]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        AUTO_QDN_FILESYSTEM_SYNC_KEY,
+        autoQdnFileSystemSync ? "1" : "0"
+      );
+    } catch (error) {}
+  }, [autoQdnFileSystemSync]);
+
+  const showPublishNotice = (prompt) => {
+    qdnPublishPromptRef.current = prompt;
+    setQdnPublishNoticeVisible(true);
+  };
+
+  const openPublishPrompt = () => {
+    if (!qdnPublishPromptRef.current) return;
+    setQdnSyncPrompt(qdnPublishPromptRef.current);
+  };
+
+  const clearPublishNotice = () => {
+    qdnPublishPromptRef.current = null;
+    setQdnPublishNoticeVisible(false);
+  };
 
   const handleNavigate = (folderName) => {
     setSelectedFileKeys([]);
@@ -840,43 +2207,332 @@ export const Manager = ({ myAddress, groups }) => {
   useEffect(() => {
     if (!myAddress?.address) return;
     const fetchFileSystem = async () => {
+      checkedQdnLoadRef.current = false;
+      setQdnFileSystemLoadReady(false);
+      setQdnSyncPrompt(null);
+      setQdnPublishNoticeVisible(false);
+      qdnPublishPromptRef.current = null;
       const data = await getPersistedFileSystemQManager(myAddress?.address);
+      const currentPrivateResourceIndex = await getPersistedPrivateResourceIndex(
+        myAddress?.address,
+        [myAddress?.name?.name, activePublishName].filter(Boolean)
+      ).catch(() => null);
+      const loadedPayload =
+        data?.private && data?.public
+          ? {
+              public: data.public,
+              private: data.private,
+              group:
+                data?.group && !Array.isArray(data.group)
+                  ? data.group
+                  : initialGroupFileSystem,
+            }
+          : {
+              public: initialFileSystem,
+              private: initialFileSystem,
+              group: initialGroupFileSystem,
+            };
+      if (currentPrivateResourceIndex) {
+        loadedPayload.privateResourceIndex = currentPrivateResourceIndex;
+      }
+      setPrivateResourceIndex(currentPrivateResourceIndex);
       if (data?.private && data?.public) {
         setFileSystemPublic(data?.public);
         setFileSystemPrivate(data?.private);
         const groupData =
-          data?.group && !Array.isArray(data.group) ? data.group : initialGroupFileSystem;
+          data?.group && !Array.isArray(data.group)
+            ? data.group
+            : initialGroupFileSystem;
         setFileSystemGroup(groupData);
       } else {
         setFileSystemPublic(initialFileSystem);
         setFileSystemPrivate(initialFileSystem);
         setFileSystemGroup(initialGroupFileSystem);
       }
+      fileSystemLoadedRef.current = true;
+      skipNextQdnPublishPromptRef.current = true;
+      dismissedPublishSnapshotRef.current = stableStringify(
+        normalizeQdnSyncPayloadForComparison(loadedPayload)
+      );
+      setQdnFileSystemLoadReady(true);
     };
     fetchFileSystem();
   }, [myAddress?.address]);
 
   useEffect(() => {
+    if (
+      !myAddress?.name?.name ||
+      !qdnFileSystemLoadReady ||
+      checkedQdnLoadRef.current
+    ) {
+      return;
+    }
+
+    let disposed = false;
+    checkedQdnLoadRef.current = true;
+    const loadPublishedFileSystem = async () => {
+      try {
+        const imported = await importFileSystemQManagerFromQDN(
+          myAddress.name.name
+        );
+        if (disposed || !imported?.public || !imported?.private) return;
+
+        const currentPrivateResourceIndex =
+          await getPersistedPrivateResourceIndex(
+            myAddress?.address,
+            [myAddress?.name?.name, activePublishName].filter(Boolean)
+          );
+
+        const importedPayload = {
+          public: imported.public,
+          private: imported.private,
+          group:
+            imported?.group && !Array.isArray(imported.group)
+              ? imported.group
+              : initialGroupFileSystem,
+          ...(imported?.privateResourceIndex
+            ? { privateResourceIndex: imported.privateResourceIndex }
+            : {}),
+        };
+        const currentPayload = {
+          public: fileSystemPublic,
+          private: fileSystemPrivate,
+          group: fileSystemGroup,
+          ...(currentPrivateResourceIndex
+            ? { privateResourceIndex: currentPrivateResourceIndex }
+            : {}),
+        };
+        const localSnapshot = stableStringify(
+          normalizeQdnSyncPayloadForComparison(currentPayload)
+        );
+        const importedSnapshot = stableStringify(
+          normalizeQdnSyncPayloadForComparison(importedPayload)
+        );
+
+        // If the dismissed snapshot matches local, the user already rejected this QDN state.
+        // Update the baseline to local and don't show the prompt (prevents deleted files from re-adding).
+        const dismissedSnapshot = dismissedPublishSnapshotRef.current;
+        if (dismissedSnapshot && dismissedSnapshot === localSnapshot) {
+          lastQdnSyncedSnapshotRef.current = localSnapshot;
+          return;
+        }
+
+        lastQdnSyncedSnapshotRef.current = importedSnapshot;
+        if (localSnapshot === importedSnapshot) {
+          return;
+        }
+
+        const diff = diffQdnSyncPayload(currentPayload, importedPayload);
+        setQdnSyncPrompt({
+          type: "load",
+          title: "Load Published Filesystem Backup?",
+          intro:
+            "A QDN backup was found that differs from the filesystem currently loaded in Q-Manager. This includes both the filesystem structure and the private resource index.",
+          fromLabel: "Current local",
+          toLabel: "Published QDN backup",
+          fromSummary: summarizeQdnSyncPayload(currentPayload),
+          toSummary: summarizeQdnSyncPayload(importedPayload),
+          diff,
+          confirmLabel: "Load backup",
+          onConfirm: async () => {
+            if (disposed) return;
+            skipNextQdnPublishPromptRef.current = true;
+            setFileSystemPublic(imported.public);
+            setFileSystemPrivate(imported.private);
+            setFileSystemGroup(importedPayload.group);
+            setCurrentPath(["Root"]);
+            // Restore the private resource index from QDN backup too
+            if (importedPayload?.privateResourceIndex && myAddress?.address) {
+              await savePrivateResourceIndexEverywhere(
+                importedPayload.privateResourceIndex,
+                myAddress.address
+              ).catch((error) => {
+                console.error(
+                  "Failed to restore private resource index from QDN backup:",
+                  error
+                );
+              });
+            }
+            clearPublishNotice();
+            dismissedPublishSnapshotRef.current = importedSnapshot;
+            setQdnSyncPrompt(null);
+          },
+          onCancel: () => {
+            const localSnap = stableStringify(
+              normalizeQdnSyncPayloadForComparison(currentPayload)
+            );
+            lastQdnSyncedSnapshotRef.current = localSnap;
+            dismissedPublishSnapshotRef.current = localSnap;
+            setQdnSyncPrompt(null);
+          },
+        });
+      } catch (error) {}
+    };
+
+    loadPublishedFileSystem();
+
+    return () => {
+      disposed = true;
+    };
+  }, [
+    myAddress?.name?.name,
+    activePublishName,
+    qdnFileSystemLoadReady,
+    fileSystemPublic,
+    fileSystemPrivate,
+    fileSystemGroup,
+  ]);
+
+  useEffect(() => {
     if (fileSystemPublic && fileSystemPrivate && myAddress?.address) {
-      const payload = {
-        public: fileSystemPublic,
-        private: fileSystemPrivate,
-        group: fileSystemGroup,
+      const syncFilesystemState = async () => {
+        const privateResourceIndex = await getPersistedPrivateResourceIndex(
+          myAddress?.address,
+          [myAddress?.name?.name, activePublishName].filter(Boolean)
+        );
+
+        const payload = {
+          public: fileSystemPublic ?? [],
+          private: fileSystemPrivate ?? [],
+          group: fileSystemGroup || {},
+          ...(privateResourceIndex ? { privateResourceIndex } : {}),
+        };
+
+        saveFileSystemQManagerEverywhere(payload, myAddress?.address).catch(
+          (error) => {
+            console.error(
+              "Failed to persist Q-Manager filesystem state:",
+              error
+            );
+          }
+        );
+
+        if (!autoQdnFileSystemSync && skipNextQdnPublishPromptRef.current) {
+          skipNextQdnPublishPromptRef.current = false;
+        }
+
+        if (
+          autoQdnFileSystemSync &&
+          myAddress?.name?.name &&
+          fileSystemLoadedRef.current
+        ) {
+          if (skipNextQdnPublishPromptRef.current) {
+            skipNextQdnPublishPromptRef.current = false;
+            return;
+          }
+
+          const currentSnapshot = stableStringify(
+            normalizeQdnSyncPayloadForComparison({
+              public: fileSystemPublic,
+              private: fileSystemPrivate,
+              group: fileSystemGroup,
+              ...(privateResourceIndex ? { privateResourceIndex } : {}),
+            })
+          );
+          const baselineSnapshot = lastQdnSyncedSnapshotRef.current;
+          if (
+            !baselineSnapshot ||
+            currentSnapshot === baselineSnapshot ||
+            currentSnapshot === dismissedPublishSnapshotRef.current
+          ) {
+            return;
+          }
+
+          if (qdnPublishPromptTimerRef.current) {
+            clearTimeout(qdnPublishPromptTimerRef.current);
+          }
+
+          qdnPublishPromptTimerRef.current = setTimeout(() => {
+            const baselinePayload = (() => {
+              try {
+                return JSON.parse(baselineSnapshot);
+              } catch (error) {
+                return null;
+              }
+            })();
+            const diff = diffQdnSyncPayload(baselinePayload, payload);
+            if (!diff.hasChanges) return;
+
+            const publishPrompt = {
+              type: "publish",
+              title: "Publish Filesystem Backup Update?",
+              intro:
+                "Your local Q-Manager filesystem differs from the last QDN backup.",
+              fromLabel: "Last QDN backup",
+              toLabel: "Current local",
+              fromSummary: summarizeQdnSyncPayload(baselinePayload),
+              toSummary: summarizeQdnSyncPayload(payload),
+              diff,
+              confirmLabel: "Publish update",
+              onConfirm: async () => {
+                try {
+                  const publishPromise = publishFileSystemQManagerToQDN({
+                    fileSystemQManager: {
+                      public: fileSystemPublic,
+                      private: fileSystemPrivate,
+                      group: fileSystemGroup,
+                    },
+                    privateResourceIndex,
+                    activePublishName:
+                      activePublishName || myAddress?.name?.name,
+                  });
+
+                  openToast(publishPromise, {
+                    loading: "Publishing filesystem structure to QDN...",
+                    success: "Filesystem structure published to QDN",
+                    error: (err) =>
+                      `Publish failed: ${err?.error || err?.message || err}`,
+                  });
+                  await publishPromise;
+                  lastQdnSyncedSnapshotRef.current = currentSnapshot;
+                  dismissedPublishSnapshotRef.current = "";
+                  clearPublishNotice();
+                } catch (error) {
+                  console.error(
+                    "Failed to publish filesystem backup update:",
+                    error
+                  );
+                } finally {
+                  setQdnSyncPrompt(null);
+                }
+              },
+              onCancel: () => {
+                dismissedPublishSnapshotRef.current = currentSnapshot;
+                setQdnSyncPrompt(null);
+              },
+            };
+
+            showPublishNotice(publishPrompt);
+          }, 1500);
+        }
       };
 
-      saveFileSystemQManagerEverywhere(payload, myAddress?.address).catch(
-        (error) => {
-          console.error("Failed to persist Q-Manager filesystem state:", error);
+      syncFilesystemState();
+
+      return () => {
+        if (qdnPublishPromptTimerRef.current) {
+          clearTimeout(qdnPublishPromptTimerRef.current);
+          qdnPublishPromptTimerRef.current = null;
         }
-      );
+      };
     }
+
+    return () => {
+      if (qdnPublishPromptTimerRef.current) {
+        clearTimeout(qdnPublishPromptTimerRef.current);
+        qdnPublishPromptTimerRef.current = null;
+      }
+    };
   }, [
     fileSystemPublic,
     fileSystemPrivate,
     fileSystemGroup,
     myAddress?.address,
+    myAddress?.name?.name,
+    activePublishName,
+    autoQdnFileSystemSync,
+    privateIndexRevision,
   ]);
-
   const addDirectoryToCurrent = (directoryName) => {
     if (!directoryName || currentPath.length === 0) return false;
 
@@ -1007,7 +2663,10 @@ export const Manager = ({ myAddress, groups }) => {
       );
       if (fileIndex !== -1) {
         targetFolderNode.children.splice(fileIndex, 1); // Remove the file from the children array
-        setFileSystem(updatedFileSystem); // Update the state
+        const snapshot = buildQdnSyncSnapshot(updatedFileSystem);
+        lastQdnSyncedSnapshotRef.current = snapshot;
+        dismissedPublishSnapshotRef.current = snapshot;
+        setFileSystem(updatedFileSystem);
         return true;
       }
 
@@ -1207,10 +2866,16 @@ export const Manager = ({ myAddress, groups }) => {
             ? { ...fileSystemGroup }
             : {};
 
-        for (const [groupIdKey, files] of Object.entries(groupedByTarget.group)) {
+        for (const [groupIdKey, files] of Object.entries(
+          groupedByTarget.group
+        )) {
           const groupId = Number(groupIdKey);
-          const currentGroupTree = nextGroupState[groupId] || cloneInitialFileSystem();
-          const mergedGroup = mergeDiscoveredFilesIntoTree(currentGroupTree, files);
+          const currentGroupTree =
+            nextGroupState[groupId] || cloneInitialFileSystem();
+          const mergedGroup = mergeDiscoveredFilesIntoTree(
+            currentGroupTree,
+            files
+          );
           if (mergedGroup.addedCount > 0) {
             nextGroupState[groupId] = mergedGroup.nextTree;
             totalAdded += mergedGroup.addedCount;
@@ -1374,10 +3039,10 @@ export const Manager = ({ myAddress, groups }) => {
     if (!over) return;
 
     const activeIndex = currentFolder.children.findIndex(
-      (item) => item.name + item.type === active.id
+      (item) => getNodeSelectionKey(item) === active.id
     );
     const overIndex = currentFolder.children.findIndex(
-      (item) => item.name + item.type === over.id
+      (item) => getNodeSelectionKey(item) === over.id
     );
 
     const updatedChildren = arrayMove(
@@ -1463,6 +3128,63 @@ export const Manager = ({ myAddress, groups }) => {
     return currentNodes; // Returns the children array of the target folder
   };
 
+  const setFileSystemAtPath = (pathArray, updatedTree) => {
+    if (mode === "public") {
+      setFileSystemPublic(updatedTree);
+    } else if (mode === "private") {
+      setFileSystemPrivate(updatedTree);
+    } else {
+      setFileSystemGroup((prev) => ({
+        ...(prev || {}),
+        [selectedGroup]: updatedTree,
+      }));
+    }
+  };
+
+  const buildQdnSyncSnapshot = (updatedTree) => {
+    const nextPublic = mode === "public" ? updatedTree : fileSystemPublic;
+    const nextPrivate = mode === "private" ? updatedTree : fileSystemPrivate;
+    const nextGroup =
+      mode === "group"
+        ? {
+            ...(
+              fileSystemGroup && !Array.isArray(fileSystemGroup)
+                ? fileSystemGroup
+                : {}
+            ),
+            ...(selectedGroup !== null && selectedGroup !== undefined
+              ? { [selectedGroup]: updatedTree }
+              : {}),
+          }
+        : fileSystemGroup && !Array.isArray(fileSystemGroup)
+          ? fileSystemGroup
+          : {};
+
+    return stableStringify(
+      normalizeQdnSyncPayloadForComparison({
+        public: nextPublic,
+        private: nextPrivate,
+        group: nextGroup,
+        ...(privateResourceIndex ? { privateResourceIndex } : {}),
+      })
+    );
+  };
+
+  const findNodeInTree = (nodeName, nodeType, tree) => {
+    if (!tree || !Array.isArray(tree)) return null;
+    // Check root-level direct children
+    for (const node of tree) {
+      if (node.name === nodeName && node.type === nodeType) {
+        return { parent: tree, index: tree.indexOf(node) };
+      }
+      if (node.children && Array.isArray(node.children)) {
+        const found = findNodeInTree(nodeName, nodeType, node.children);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+
   const moveNodeByPath = (
     nodeName,
     nodeType,
@@ -1474,70 +3196,107 @@ export const Manager = ({ myAddress, groups }) => {
       return false;
     }
 
-    const updatedFileSystem = JSON.parse(JSON.stringify(fileSystem));
-
-    // Updated traverseToFolder function (as above)
-    const traverseToFolder = (pathArray, nodes) => {
-      let currentNodes = nodes;
-      let folder = null;
-
-      for (const dir of pathArray) {
-        folder = currentNodes.find(
-          (node) => node.name === dir && node.type === "folder"
-        );
-        if (!folder) {
-          console.error(`Folder not found: ${dir}`);
-          return null;
-        }
-        currentNodes = folder.children;
+    // Search all file systems for the node
+    const fsConfigs = [];
+    if (mode === "public") {
+      fsConfigs.push({ key: "public", data: fileSystemPublic });
+      fsConfigs.push({ key: "private", data: fileSystemPrivate });
+      if (fileSystemGroup && selectedGroup) {
+        fsConfigs.push({
+          key: `group_${selectedGroup}`,
+          data: fileSystemGroup[selectedGroup] || [],
+        });
       }
-
-      return folder;
-    };
-
-    // Locate the source folder (where the node currently resides)
-    const sourceFolder = traverseToFolder(sourcePathArray, updatedFileSystem);
-    if (!sourceFolder || !sourceFolder.children) {
-      console.error("Source folder not found");
-      return false;
+    } else if (mode === "private") {
+      fsConfigs.push({ key: "private", data: fileSystemPrivate });
+      fsConfigs.push({ key: "public", data: fileSystemPublic });
+      if (fileSystemGroup && selectedGroup) {
+        fsConfigs.push({
+          key: `group_${selectedGroup}`,
+          data: fileSystemGroup[selectedGroup] || [],
+        });
+      }
+    } else {
+      fsConfigs.push({
+        key: `group_${selectedGroup}`,
+        data: fileSystemGroup[selectedGroup] || [],
+      });
+      fsConfigs.push({ key: "public", data: fileSystemPublic });
+      fsConfigs.push({ key: "private", data: fileSystemPrivate });
     }
 
-    // Locate the target folder
-    const targetFolder =
-      targetPathArray.length > 0
-        ? traverseToFolder(targetPathArray, updatedFileSystem)
-        : { children: updatedFileSystem };
+    for (const fsConfig of fsConfigs) {
+      if (!fsConfig.data || !Array.isArray(fsConfig.data)) continue;
 
-    if (!targetFolder || !targetFolder.children) {
-      console.error("Target folder not found");
-      return false;
+      const source = findNodeInTree(nodeName, nodeType, fsConfig.data);
+      if (!source) continue;
+
+      const updatedTree = JSON.parse(JSON.stringify(fsConfig.data));
+      const [nodeToMove] =
+        fsConfig.data[source.index].children !== undefined
+          ? updatedTree[source.index].children.splice(0, 1) // node is a direct child of root, not in children array
+          : [updatedTree[source.index]]; // This shouldn't happen for files
+
+      // Rebuild: find the actual node in the deep tree
+      const rebuildMove = () => {
+        let moved = false;
+        const moveInTree = (nodes) => {
+          if (moved) return;
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            if (n.name === nodeName && n.type === nodeType) {
+              const [toMove] = nodes.splice(i, 1);
+              moved = true;
+              return toMove;
+            }
+            if (n.children) {
+              const result = moveInTree(n.children);
+              if (result) return result;
+            }
+          }
+          return null;
+        };
+
+        const toMove = moveInTree(JSON.parse(JSON.stringify(updatedTree)));
+        if (!toMove) return null;
+
+        // Find target folder
+        const targetTree = JSON.parse(JSON.stringify(fsConfig.data));
+        const moveInTargetTree = (nodes) => {
+          if (targetPathArray.length === 0) return nodes;
+          let current = nodes;
+          for (const dir of targetPathArray) {
+            const folder = current.find(
+              (n) => n.name === dir && n.type === "folder"
+            );
+            if (!folder) return null;
+            current = folder.children;
+          }
+          return current;
+        };
+
+        const targetFolder = moveInTargetTree(targetTree);
+        if (!targetFolder || !targetFolder.children) return false;
+
+        const existingNames = targetFolder.children
+          .filter((node) => node.type === nodeType)
+          .map((node) => node.name);
+        toMove.name = ensureUniqueName(toMove.name, existingNames);
+        targetFolder.children.push(toMove);
+
+        setFileSystemAtPath(
+          targetPathArray.length === 0 ? [] : targetPathArray,
+          targetTree
+        );
+        return true;
+      };
+
+      const result = rebuildMove();
+      if (result) return true;
     }
 
-    // Find and remove the node from the source folder
-    const nodeIndex = sourceFolder.children.findIndex(
-      (node) => node.name === nodeName && node.type === nodeType
-    );
-
-    if (nodeIndex === -1) {
-      console.error("Node not found in source folder");
-      return false;
-    }
-
-    const [nodeToMove] = sourceFolder.children.splice(nodeIndex, 1);
-
-    // Check for naming conflicts in the target folder
-    const existingNames = targetFolder.children
-      .filter((node) => node.type === nodeType)
-      .map((node) => node.name);
-
-    nodeToMove.name = ensureUniqueName(nodeToMove.name, existingNames);
-
-    // Add the node to the target folder
-    targetFolder.children.push(nodeToMove);
-
-    // Update the state
-    setFileSystem(updatedFileSystem);
-    return true;
+    console.error("Node not found in any file system");
+    return false;
   };
 
   const sensors = useSensors(
@@ -1566,13 +3325,21 @@ export const Manager = ({ myAddress, groups }) => {
     );
   }, [currentFolder?.children, mode, selectedGroup]);
 
+  const resolvedVisibleItems = useMemo(
+    () =>
+      visibleItems.map((item) =>
+        resolvePrivateResourceItem(item, privateResourceIndex)
+      ),
+    [visibleItems, privateResourceIndex]
+  );
+
   const selectedVisibleFiles = useMemo(() => {
-    return visibleItems.filter(
+    return resolvedVisibleItems.filter(
       (item) =>
         item?.type === "file" &&
         selectedFileKeys.includes(getNodeSelectionKey(item))
     );
-  }, [visibleItems, selectedFileKeys]);
+  }, [resolvedVisibleItems, selectedFileKeys]);
 
   const selectedSizeSummary = useMemo(() => {
     let totalBytes = 0;
@@ -1589,6 +3356,22 @@ export const Manager = ({ myAddress, groups }) => {
       unknownCount: selectedVisibleFiles.length - knownCount,
     };
   }, [selectedVisibleFiles]);
+
+  const resolvedSelectedFile = useMemo(
+    () =>
+      selectedFile
+        ? resolvePrivateResourceItem(selectedFile, privateResourceIndex)
+        : null,
+    [selectedFile, privateResourceIndex]
+  );
+
+  const resolvedPreviewFile = useMemo(
+    () =>
+      previewFile
+        ? resolvePrivateResourceItem(previewFile, privateResourceIndex)
+        : null,
+    [previewFile, privateResourceIndex]
+  );
 
   const toggleSelectFile = (item) => {
     if (item?.type !== "file") return;
@@ -1639,6 +3422,11 @@ export const Manager = ({ myAddress, groups }) => {
       if (child?.type !== "file") return true;
       return !selectedKeys.has(getNodeSelectionKey(child));
     });
+
+    // Build snapshot from the modified tree so the auto-sync baseline matches the local filesystem state.
+    const snapshot = buildQdnSyncSnapshot(updatedFileSystem);
+    lastQdnSyncedSnapshotRef.current = snapshot;
+    dismissedPublishSnapshotRef.current = snapshot;
 
     setFileSystem(updatedFileSystem);
     clearSelection();
@@ -1705,7 +3493,9 @@ export const Manager = ({ myAddress, groups }) => {
       let nodes = updatedFileSystem;
       let folder = null;
       for (const part of pathArray) {
-        folder = nodes.find((node) => node.name === part && node.type === "folder");
+        folder = nodes.find(
+          (node) => node.name === part && node.type === "folder"
+        );
         if (!folder) return null;
         nodes = folder.children;
       }
@@ -1742,23 +3532,301 @@ export const Manager = ({ myAddress, groups }) => {
     clearSelection();
   };
 
+  const isPrivateService = (service) => {
+    return (
+      typeof service === "string" && service.toUpperCase().includes("_PRIVATE")
+    );
+  };
+
+  const isGroupResource = (file) => {
+    return Boolean(file?.group || file?.groupId);
+  };
+
+  const isPrivateFile = (file) => {
+    // Check encryptionType field (e.g., "private" or "group")
+    const encryptionType =
+      typeof file?.encryptionType === "string"
+        ? file.encryptionType.toLowerCase()
+        : "";
+    if (encryptionType === "private" || encryptionType === "group") {
+      return true;
+    }
+    // Also check if service name indicates private
+    const service = getServiceName(file);
+    if (
+      typeof service === "string" &&
+      service.toUpperCase().includes("_PRIVATE")
+    ) {
+      return true;
+    }
+    // Check identifier prefix
+    const identifier = file?.identifier || "";
+    if (typeof identifier === "string") {
+      const idLower = identifier.toLowerCase();
+      if (
+        idLower.startsWith("p-") ||
+        idLower.startsWith("pvt-") ||
+        idLower.startsWith("grp-")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const getPrivateServiceName = (file) => {
+    const baseService = file.service?.toUpperCase() || "";
+    const isAlreadyPrivate = baseService.includes("_PRIVATE");
+    return isAlreadyPrivate ? baseService : `${baseService}_PRIVATE`;
+  };
+
   const deleteSelectedFromQDN = async () => {
     if (selectedVisibleFiles.length === 0) return;
     const filesToDelete = [...selectedVisibleFiles];
-    const tombstoneData64 = btoa("d");
+
+    const accountPublicKey = myAddress?.publicKey || "";
+    const myName = activePublishName || myAddress?.name?.name || "";
 
     const promise = (async () => {
       removeSelectedFromManager();
 
+      const failures = [];
+
       for (const file of filesToDelete) {
         if (!file?.identifier || !file?.service) continue;
-        await qortalRequest({
-          action: "PUBLISH_QDN_RESOURCE",
-          service: file.service,
-          identifier: file.identifier,
-          data64: tombstoneData64,
-        });
+
+        if (isPrivateFile(file) || isPrivateService(file.service)) {
+          // Private service type or encrypted file - need to publish encrypted data.
+          const tombstonePayload = btoa("d");
+          const sharingKey = file?.sharingKey || file?.key;
+          const targetService = getPrivateServiceName(file) || file.service;
+
+          // Try 1: ENCRYPT_DATA_WITH_SHARING_KEY uses the stored sharing key from private index entry
+          // The Qortal Wallet looks up the sharing key internally using the resource's identifier
+          // Note: ENCRYPT_DATA_WITH_SHARING_KEY uses `base64` param (not data64), and returns a raw base64 string
+          try {
+            console.log(
+              "[DELETE] Try ENCRYPT_DATA_WITH_SHARING_KEY for",
+              file.service,
+              file.identifier
+            );
+            const encryptedResponse = await requestQortal({
+              action: "ENCRYPT_DATA_WITH_SHARING_KEY",
+              base64: tombstonePayload,
+            });
+            console.log(
+              "[DELETE] ENCRYPT_DATA_WITH_SHARING_KEY response type:",
+              typeof encryptedResponse,
+              typeof encryptedResponse === "string"
+                ? "raw string (length " + (encryptedResponse?.length || 0) + ")"
+                : JSON.stringify(encryptedResponse)
+            );
+            // The response is a raw base64 string
+            const encryptedData =
+              typeof encryptedResponse === "string"
+                ? encryptedResponse
+                : encryptedResponse?.data64 || encryptedResponse?.encryptedData;
+            if (encryptedData) {
+              console.log(
+                "[DELETE] Publishing to",
+                targetService,
+                file.identifier,
+                "with encryptedData length",
+                encryptedData.length
+              );
+              const publishResult = await requestQortal({
+                action: "PUBLISH_QDN_RESOURCE",
+                name: myName,
+                service: targetService,
+                identifier: file.identifier,
+                data64: encryptedData,
+                externalEncrypt: true,
+              });
+              console.log(
+                "[DELETE] PUBLISH_QDN_RESOURCE response:",
+                publishResult
+              );
+              if (publishResult?.identifier) continue;
+            }
+          } catch (error) {
+            console.error(
+              "[DELETE] ENCRYPT_DATA_WITH_SHARING_KEY failed for",
+              file.service,
+              file.identifier,
+              error
+            );
+          }
+
+          // Try 2: ENCRYPT_DATA uses account public key for standard private encryption
+          // ENCRYPT_DATA uses `data64` param and returns a raw base64 string
+          try {
+            console.log(
+              "[DELETE] Try ENCRYPT_DATA for",
+              file.service,
+              file.identifier,
+              "publicKey:",
+              accountPublicKey ? "set" : "MISSING"
+            );
+            const encryptParams = {
+              action: "ENCRYPT_DATA",
+              data64: tombstonePayload,
+            };
+            if (accountPublicKey) {
+              encryptParams.publicKey = accountPublicKey;
+            }
+            const encryptedResponse = await requestQortal(encryptParams);
+            console.log(
+              "[DELETE] ENCRYPT_DATA response type:",
+              typeof encryptedResponse,
+              typeof encryptedResponse === "string"
+                ? "raw string (length " + (encryptedResponse?.length || 0) + ")"
+                : JSON.stringify(encryptedResponse)
+            );
+            // The response is a raw base64 string
+            const encryptedData =
+              typeof encryptedResponse === "string"
+                ? encryptedResponse
+                : encryptedResponse?.data64 || encryptedResponse?.encryptedData;
+            if (encryptedData) {
+              console.log(
+                "[DELETE] Publishing to",
+                targetService,
+                file.identifier,
+                "with encryptedData length",
+                encryptedData.length
+              );
+              const publishResult = await requestQortal({
+                action: "PUBLISH_QDN_RESOURCE",
+                name: myName,
+                service: targetService,
+                identifier: file.identifier,
+                data64: encryptedData,
+                externalEncrypt: true,
+              });
+              console.log(
+                "[DELETE] PUBLISH_QDN_RESOURCE response:",
+                publishResult
+              );
+              if (publishResult?.identifier) continue;
+            }
+          } catch (error) {
+            console.error(
+              "[DELETE] ENCRYPT_DATA failed for",
+              file.service,
+              file.identifier,
+              error
+            );
+          }
+
+          failures.push(
+            `${file.service}/${file.identifier} (encryption failed)`
+          );
+        } else if (isGroupResource(file)) {
+          // Group resource - encrypt with group
+          try {
+            const tombstonePayload = btoa("d");
+            const encryptedData = await requestQortal({
+              action: "ENCRYPT_QORTAL_GROUP_DATA",
+              data64: tombstonePayload,
+              groupId: file.group || file.groupId,
+            });
+            if (encryptedData) {
+              const publishResult = await requestQortal({
+                action: "PUBLISH_QDN_RESOURCE",
+                service: file.service,
+                identifier: file.identifier,
+                data64: encryptedData,
+              });
+              if (publishResult?.identifier) continue;
+            }
+          } catch (error) {
+            console.error("Delete: group encryption publish failed:", error);
+          }
+
+          failures.push(
+            `${file.service}/${file.identifier} (group encryption failed)`
+          );
+        } else {
+          // Public service - raw data is fine
+          try {
+            const publishResult = await requestQortal({
+              action: "PUBLISH_QDN_RESOURCE",
+              service: file.service,
+              identifier: file.identifier,
+              data64: btoa("d"),
+            });
+            if (publishResult?.identifier) continue;
+          } catch (error) {
+            console.error("Delete: public publish failed:", error);
+          }
+
+          failures.push(
+            `${file.service}/${file.identifier} (public publish failed)`
+          );
+        }
       }
+
+      // Refresh the QDN snapshot by fetching directly from the QDN resource endpoint
+      // so the diff sees the actual published state after the tombstone publish.
+      let currentQdnState = null;
+      try {
+        const response = await fetch(
+          `/arbitrary/DOCUMENT_PRIVATE/${myAddress.name.name}/${QDN_STRUCTURE_IDENTIFIER}?encoding=base64`
+        );
+        if (response.ok) {
+          const encryptedData = await response.text();
+          const decryptedData = await requestQortal({
+            action: "DECRYPT_DATA",
+            encryptedData,
+          });
+          const decryptedBytes = base64ToUint8Array(decryptedData);
+          currentQdnState = uint8ArrayToObject(decryptedBytes);
+        }
+      } catch (e) {
+        // If we can't fetch QDN state, fall back to local state
+        currentQdnState = {
+          public: fileSystemPublic,
+          private: fileSystemPrivate,
+          group: fileSystemGroup,
+        };
+      }
+
+      // Build synced snapshot using the QDN state we just fetched.
+      // The QDN backup includes both filesystem and privateResourceIndex.
+      // The diff compares each independently so filesystem deletions and
+      // private index additions/removals are all shown accurately.
+      //
+      // After a file delete, the local private index still has the file's entries
+      // (they're published separately to QDN). So we merge the local private index
+      // into the snapshot so the diff sees private index entries as "unchanged"
+      // on both sides. This is correct because the private index is managed locally
+      // and the QDN backup only stores the filesystem structure.
+      const localPrivateIndex = await getPersistedPrivateResourceIndex(
+        myAddress?.address,
+        [myAddress?.name?.name, activePublishName].filter(Boolean)
+      ).catch(() => null);
+
+      const syncedSnapshot = stableStringify(
+        normalizeQdnSyncPayloadForComparison({
+          public: currentQdnState?.public || fileSystemPublic,
+          private: currentQdnState?.private || fileSystemPrivate,
+          group: currentQdnState?.group || fileSystemGroup,
+          ...(localPrivateIndex ? { privateResourceIndex: localPrivateIndex } : {}),
+        })
+      );
+
+      if (failures.length > 0) {
+        lastQdnSyncedSnapshotRef.current = syncedSnapshot;
+        dismissedPublishSnapshotRef.current = syncedSnapshot;
+        throw new Error(
+          `Failed to publish tombstone for: ${failures.join(", ")}. ` +
+            "The file was removed locally but the QDN publish may have failed. " +
+            "Please try again."
+        );
+      }
+
+      lastQdnSyncedSnapshotRef.current = syncedSnapshot;
+      dismissedPublishSnapshotRef.current = syncedSnapshot;
     })();
 
     openToast(promise, {
@@ -1784,12 +3852,12 @@ export const Manager = ({ myAddress, groups }) => {
           }}
           centered
         >
-          <Tab label='public' value='public' />
-          <Tab label='private' value='private' />
-          <Tab label='groups' value='group' />
+          <Tab label="public" value="public" />
+          <Tab label="private" value="private" />
+          <Tab label="groups" value="group" />
         </Tabs>
       </Box>
-      <Spacer height='20px' />
+      <Spacer height="20px" />
       <Box
         sx={{
           display: "flex",
@@ -1807,6 +3875,43 @@ export const Manager = ({ myAddress, groups }) => {
           Q-Manager
         </Typography>
       </Box>
+      <Box
+        sx={{
+          px: "18px",
+          py: "6px",
+          display: "flex",
+          gap: "14px",
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <Box>
+          <Label>Publish name</Label>
+          <Select
+            size="small"
+            value={activePublishName || myAddress?.name?.name || ""}
+            onChange={(event) => setActivePublishName(event.target.value)}
+            sx={{ width: "220px" }}
+            MenuProps={{
+              PaperProps: {
+                sx: {
+                  backgroundColor: "#333333",
+                  color: "#ffffff",
+                },
+              },
+            }}
+          >
+            {publishNames.map((nameItem, index) => (
+              <MenuItem
+                key={`${nameItem?.name || "publish-name"}-${index}`}
+                value={nameItem.name}
+              >
+                {nameItem.name}
+              </MenuItem>
+            ))}
+          </Select>
+        </Box>
+      </Box>
       {mode === "group" && (
         <Box
           sx={{
@@ -1815,9 +3920,9 @@ export const Manager = ({ myAddress, groups }) => {
         >
           <Label>Select group</Label>
           <Select
-            size='small'
-            labelId='label-manager-groups'
-            id='id-manager-groups'
+            size="small"
+            labelId="label-manager-groups"
+            id="id-manager-groups"
             value={selectedGroup}
             displayEmpty
             onChange={(e) => {
@@ -1864,22 +3969,92 @@ export const Manager = ({ myAddress, groups }) => {
           sx={{ m: 0 }}
           control={
             <Checkbox
-              size='small'
+              size="small"
               checked={showThumbnails}
               onChange={(event) => setShowThumbnails(event.target.checked)}
             />
           }
           label={
-            <Typography sx={{ fontSize: "14px" }}>Show thumbnails</Typography>
+            <Typography sx={{ fontSize: "14px" }}>
+              Show public thumbnails
+            </Typography>
           }
         />
+        <FormControlLabel
+          sx={{ m: 0, ml: "12px" }}
+          control={
+            <Checkbox
+              size="small"
+              checked={showPrivateThumbnails}
+              onChange={(event) =>
+                setShowPrivateThumbnails(event.target.checked)
+              }
+            />
+          }
+          label={
+            <Typography sx={{ fontSize: "14px" }}>
+              Show private thumbnails
+            </Typography>
+          }
+        />
+        <FormControlLabel
+          sx={{ m: 0, ml: "12px" }}
+          control={
+            <Checkbox
+              size="small"
+              checked={autoQdnFileSystemSync}
+              onChange={(event) =>
+                setAutoQdnFileSystemSync(event.target.checked)
+              }
+            />
+          }
+          label={
+            <Typography sx={{ fontSize: "14px" }}>
+              Sync filesystem backup
+            </Typography>
+          }
+        />
+        {autoQdnFileSystemSync &&
+          qdnPublishNoticeVisible &&
+          qdnPublishPromptRef.current && (
+          <Tooltip title="QDN backup is out of date">
+            <Badge
+              color="error"
+              badgeContent="!"
+              overlap="circular"
+              sx={{
+                ml: "10px",
+                "& .MuiBadge-badge": {
+                  fontSize: "11px",
+                  fontWeight: 700,
+                  minWidth: "18px",
+                  height: "18px",
+                  borderRadius: "999px",
+                },
+              }}
+            >
+              <IconButton
+                size="small"
+                onClick={openPublishPrompt}
+                sx={{
+                  color: "#ffbf6e",
+                  border: "1px solid rgba(255,191,110,0.35)",
+                  backgroundColor: "rgba(255,191,110,0.08)",
+                  ml: "2px",
+                }}
+              >
+                <NotificationsActiveOutlinedIcon fontSize="small" />
+              </IconButton>
+            </Badge>
+          </Tooltip>
+        )}
       </Box>
       {mode === "group" && !selectedGroup ? (
         <></>
       ) : (
         <>
           <Stack
-            direction='row'
+            direction="row"
             spacing={2}
             sx={{
               position: "fixed",
@@ -1898,10 +4073,10 @@ export const Manager = ({ myAddress, groups }) => {
           >
             {selectedVisibleFiles.length > 0 ? (
               <>
-                <Typography variant='body2' sx={{ opacity: 0.85 }}>
+                <Typography variant="body2" sx={{ opacity: 0.85 }}>
                   {selectedVisibleFiles.length} selected
                 </Typography>
-                <Typography variant='body2' sx={{ opacity: 0.75 }}>
+                <Typography variant="body2" sx={{ opacity: 0.75 }}>
                   {selectedSizeSummary.knownCount > 0
                     ? `Size: ${formatBytes(selectedSizeSummary.totalBytes)}${
                         selectedSizeSummary.unknownCount > 0
@@ -1921,7 +4096,7 @@ export const Manager = ({ myAddress, groups }) => {
                     borderRadius: "5px",
                   }}
                 >
-                  <Typography variant='body2'>Unselect</Typography>
+                  <Typography variant="body2">Unselect</Typography>
                 </ButtonBase>
                 <ButtonBase
                   onClick={() => {
@@ -1935,7 +4110,7 @@ export const Manager = ({ myAddress, groups }) => {
                     borderRadius: "5px",
                   }}
                 >
-                  <Typography variant='body2'>Move</Typography>
+                  <Typography variant="body2">Move</Typography>
                 </ButtonBase>
                 <ButtonBase
                   onClick={() => {
@@ -1948,7 +4123,7 @@ export const Manager = ({ myAddress, groups }) => {
                     borderRadius: "5px",
                   }}
                 >
-                  <Typography variant='body2'>Remove</Typography>
+                  <Typography variant="body2">Remove</Typography>
                 </ButtonBase>
                 <ButtonBase
                   onClick={async () => {
@@ -1963,7 +4138,7 @@ export const Manager = ({ myAddress, groups }) => {
                     borderRadius: "5px",
                   }}
                 >
-                  <Typography variant='body2'>Delete from QDN</Typography>
+                  <Typography variant="body2">Delete from QDN</Typography>
                 </ButtonBase>
               </>
             ) : (
@@ -1982,7 +4157,7 @@ export const Manager = ({ myAddress, groups }) => {
                   }}
                 >
                   <SaveAltIcon sx={{ fontSize: "28px" }} />
-                  <Typography variant='body2'>Save data</Typography>
+                  <Typography variant="body2">Save data</Typography>
                 </ButtonBase>
                 <ButtonBase
                   onClick={async () => {
@@ -2002,7 +4177,7 @@ export const Manager = ({ myAddress, groups }) => {
                   }}
                 >
                   <CreateNewFolderIcon sx={{ fontSize: "28px" }} />
-                  <Typography variant='body2'>+Folder</Typography>
+                  <Typography variant="body2">+Folder</Typography>
                 </ButtonBase>
                 <ButtonBase
                   onClick={() => {
@@ -2016,7 +4191,7 @@ export const Manager = ({ myAddress, groups }) => {
                   }}
                 >
                   <InsertDriveFileIcon sx={{ fontSize: "28px" }} />
-                  <Typography variant='body2'>+File</Typography>
+                  <Typography variant="body2">+File</Typography>
                 </ButtonBase>
               </>
             )}
@@ -2042,7 +4217,7 @@ export const Manager = ({ myAddress, groups }) => {
               setCurrentPath={setCurrentPath}
             />
           </Box>
-          <Spacer height='5px' />
+          <Spacer height="5px" />
           <AppsContainer
             sx={{
               gap: "0px",
@@ -2056,30 +4231,42 @@ export const Manager = ({ myAddress, groups }) => {
               onDragEnd={handleDragEnd}
             >
               <SortableContext
-                items={visibleItems?.map((item) => item.name + item.type)}
+                items={resolvedVisibleItems?.map((item) =>
+                  getNodeSelectionKey(item)
+                )}
               >
-                {visibleItems?.map((item) => (
+                {resolvedVisibleItems?.map((item) => (
                   <SortableItem
-                    key={item.name + item.type}
+                    key={getNodeSelectionKey(item)}
                     item={item}
+                    accountAddress={myAddress?.address}
+                    accountPublicKey={myAddress?.publicKey}
+                    privateResourceIndex={privateResourceIndex}
                     fileSystem={fileSystem}
                     currentPath={currentPath}
-                    selected={selectedFileKeys.includes(getNodeSelectionKey(item))}
+                    selected={selectedFileKeys.includes(
+                      getNodeSelectionKey(item)
+                    )}
                     showThumbnails={showThumbnails}
+                    showPrivateThumbnails={showPrivateThumbnails}
                     onToggleSelect={() => toggleSelectFile(item)}
                     moveNode={moveNodeByPath}
                     onPreview={() => {
                       setPreviewFile(item);
                     }}
                     onHydrateMetadata={(metadata) => {
-                      if (!metadata || Object.keys(metadata).length === 0) return;
+                      if (!metadata || Object.keys(metadata).length === 0)
+                        return;
                       updateByPath({
                         ...item,
                         ...metadata,
                       });
                       setSelectedFile((prev) => {
                         if (!prev) return prev;
-                        if (getNodeSelectionKey(prev) !== getNodeSelectionKey(item)) {
+                        if (
+                          getNodeSelectionKey(prev) !==
+                          getNodeSelectionKey(item)
+                        ) {
                           return prev;
                         }
                         return {
@@ -2114,7 +4301,9 @@ export const Manager = ({ myAddress, groups }) => {
 
       {isOpenPublish && (
         <ShowAction
-          myName={myAddress?.name?.name}
+          myName={activePublishName || myAddress?.name?.name}
+          accountAddress={myAddress?.address}
+          accountPublicKey={myAddress?.publicKey}
           addNodeByPath={addNodeByPath}
           handleClose={() => setIsOpenPublish(false)}
           selectedAction={{
@@ -2129,8 +4318,8 @@ export const Manager = ({ myAddress, groups }) => {
       {isShow && (
         <Dialog
           open={isShow}
-          aria-labelledby='alert-dialog-title'
-          aria-describedby='alert-dialog-description'
+          aria-labelledby="alert-dialog-title"
+          aria-describedby="alert-dialog-description"
           PaperProps={{
             style: {
               backgroundColor: "rgb(39, 40, 44)",
@@ -2146,11 +4335,11 @@ export const Manager = ({ myAddress, groups }) => {
                 </Typography>
               </DialogContent>
               <DialogActions>
-                <Button variant='contained' onClick={onCancel}>
+                <Button variant="contained" onClick={onCancel}>
                   Cancel
                 </Button>
                 <Button
-                  variant='contained'
+                  variant="contained"
                   onClick={() => onOk(newDirName)}
                   autoFocus
                 >
@@ -2167,11 +4356,11 @@ export const Manager = ({ myAddress, groups }) => {
                 </Typography>
               </DialogContent>
               <DialogActions>
-                <Button variant='contained' onClick={onCancel}>
+                <Button variant="contained" onClick={onCancel}>
                   Cancel
                 </Button>
                 <Button
-                  variant='contained'
+                  variant="contained"
                   onClick={() => onOk(newDirName)}
                   autoFocus
                 >
@@ -2189,19 +4378,19 @@ export const Manager = ({ myAddress, groups }) => {
                   style={{
                     maxWidth: "100%",
                   }}
-                  type='text'
-                  className='custom-input'
+                  type="text"
+                  className="custom-input"
                   value={newDirName}
                   onChange={(e) => setNewDirName(e.target.value)}
                 />
               </DialogContent>
               <DialogActions>
-                <Button variant='contained' onClick={onCancel}>
+                <Button variant="contained" onClick={onCancel}>
                   Cancel
                 </Button>
                 <Button
                   disabled={!newDirName}
-                  variant='contained'
+                  variant="contained"
                   onClick={() => onOk(newDirName)}
                   autoFocus
                 >
@@ -2219,19 +4408,19 @@ export const Manager = ({ myAddress, groups }) => {
                   style={{
                     maxWidth: "100%",
                   }}
-                  type='text'
-                  className='custom-input'
+                  type="text"
+                  className="custom-input"
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
                 />
               </DialogContent>
               <DialogActions>
-                <Button variant='contained' onClick={onCancel}>
+                <Button variant="contained" onClick={onCancel}>
                   Cancel
                 </Button>
                 <Button
                   disabled={!newName}
-                  variant='contained'
+                  variant="contained"
                   onClick={() => onOk(newName)}
                   autoFocus
                 >
@@ -2251,19 +4440,29 @@ export const Manager = ({ myAddress, groups }) => {
                   }}
                 >
                   <Button
-                    variant='contained'
+                    variant="contained"
                     onClick={async () => {
                       try {
+                        const privateResourceIndex =
+                          await getPersistedPrivateResourceIndex(
+                            myAddress?.address,
+                            [myAddress?.name?.name, activePublishName].filter(
+                              Boolean
+                            )
+                          );
                         const payload = {
                           public: fileSystemPublic,
                           private: fileSystemPrivate,
                           group: fileSystemGroup,
+                          ...(privateResourceIndex
+                            ? { privateResourceIndex }
+                            : {}),
                         };
                         const data64 = await objectToBase64({
                           ...payload,
                         });
 
-                        const encryptedData = await qortalRequest({
+                        const encryptedData = await requestQortal({
                           action: "ENCRYPT_DATA",
                           data64,
                         });
@@ -2275,7 +4474,7 @@ export const Manager = ({ myAddress, groups }) => {
                           .toISOString()
                           .replace(/:/g, "-"); // Safe timestamp for filenames
                         const filename = `q-manager-backup-filesystem-${myAddress?.address}-${timestamp}.txt`;
-                        await qortalRequest({
+                        await requestQortal({
                           action: "SAVE_FILE",
                           filename,
                           blob,
@@ -2286,11 +4485,11 @@ export const Manager = ({ myAddress, groups }) => {
                     Export filesystem data to local disk
                   </Button>
                   <Button
-                    variant='contained'
+                    variant="contained"
                     onClick={async () => {
                       try {
                         const fileContent = await handleImportClick();
-                        const decryptedData = await qortalRequest({
+                        const decryptedData = await requestQortal({
                           action: "DECRYPT_DATA",
                           encryptedData: fileContent,
                         });
@@ -2303,11 +4502,27 @@ export const Manager = ({ myAddress, groups }) => {
                           setFileSystemPublic(responseData?.public);
                           setFileSystemPrivate(responseData?.private);
                           const groupData =
-                            responseData?.group && !Array.isArray(responseData.group)
+                            responseData?.group &&
+                            !Array.isArray(responseData.group)
                               ? responseData.group
                               : initialGroupFileSystem;
                           setFileSystemGroup(groupData);
                           setCurrentPath(["Root"]);
+                          if (
+                            responseData?.privateResourceIndex &&
+                            myAddress?.address
+                          ) {
+                            await savePrivateResourceIndexEverywhere(
+                              responseData.privateResourceIndex,
+                              myAddress.address
+                            ).catch((error) => {
+                              console.error(
+                                "Failed to save imported private resource index:",
+                                error
+                              );
+                            });
+                          }
+                          clearPublishNotice();
                         }
                       } catch (error) {
                         console.log("error", error);
@@ -2317,14 +4532,24 @@ export const Manager = ({ myAddress, groups }) => {
                     Import filesystem
                   </Button>
                   <Button
-                    variant='contained'
+                    variant="contained"
                     onClick={async () => {
+                      const privateResourceIndex =
+                        await getPersistedPrivateResourceIndex(
+                          myAddress?.address,
+                          [myAddress?.name?.name, activePublishName].filter(
+                            Boolean
+                          )
+                        );
                       const promise = publishFileSystemQManagerToQDN({
                         fileSystemQManager: {
                           public: fileSystemPublic,
                           private: fileSystemPrivate,
                           group: fileSystemGroup,
                         },
+                        privateResourceIndex,
+                        activePublishName:
+                          activePublishName || myAddress?.name?.name,
                       });
 
                       openToast(promise, {
@@ -2334,12 +4559,24 @@ export const Manager = ({ myAddress, groups }) => {
                           `Publish failed: ${err?.error || err?.message || err}`,
                       });
                       await promise;
+                      lastQdnSyncedSnapshotRef.current = stableStringify(
+                        normalizeQdnSyncPayloadForComparison({
+                          public: fileSystemPublic,
+                          private: fileSystemPrivate,
+                          group: fileSystemGroup,
+                          ...(privateResourceIndex
+                            ? { privateResourceIndex }
+                            : {}),
+                        })
+                      );
+                      dismissedPublishSnapshotRef.current = "";
+                      clearPublishNotice();
                     }}
                   >
                     Publish filesystem structure to QDN
                   </Button>
                   <Button
-                    variant='contained'
+                    variant="contained"
                     onClick={async () => {
                       const promise = importFileSystemQManagerFromQDN(
                         myAddress?.name?.name
@@ -2362,13 +4599,14 @@ export const Manager = ({ myAddress, groups }) => {
                             : initialGroupFileSystem;
                         setFileSystemGroup(groupData);
                         setCurrentPath(["Root"]);
+                        clearPublishNotice();
                       }
                     }}
                   >
                     Import filesystem structure from QDN
                   </Button>
                   <Button
-                    variant='contained'
+                    variant="contained"
                     onClick={async () => {
                       try {
                         await discoverAndImportPublishedQManagerFiles();
@@ -2380,7 +4618,7 @@ export const Manager = ({ myAddress, groups }) => {
                 </Box>
               </DialogContent>
               <DialogActions>
-                <Button variant='contained' onClick={onCancel}>
+                <Button variant="contained" onClick={onCancel}>
                   Close
                 </Button>
               </DialogActions>
@@ -2420,14 +4658,14 @@ export const Manager = ({ myAddress, groups }) => {
           {renderFolderTreeForBulkMove(fileSystem)}
           <Box sx={{ mt: 2, display: "flex", gap: "10px" }}>
             <Button
-              variant='contained'
+              variant="contained"
               disabled={!bulkMoveTargetPath.length}
               onClick={moveSelectedToPath}
             >
               Move here
             </Button>
             <Button
-              variant='contained'
+              variant="contained"
               onClick={() => {
                 setShowBulkMoveModal(false);
                 setBulkMoveTargetPath([]);
@@ -2438,20 +4676,160 @@ export const Manager = ({ myAddress, groups }) => {
           </Box>
         </Box>
       </Modal>
+      <Dialog
+        open={!!qdnSyncPrompt}
+        onClose={() => qdnSyncPrompt?.onCancel?.()}
+        maxWidth="sm"
+        fullWidth
+        PaperProps={{
+          style: {
+            backgroundColor: "rgb(39, 40, 44)",
+            color: "#ffffff",
+          },
+        }}
+      >
+        <DialogTitle>{qdnSyncPrompt?.title}</DialogTitle>
+        <DialogContent>
+          <Typography sx={{ fontSize: "14px", mb: 2 }}>
+            {qdnSyncPrompt?.intro}
+          </Typography>
+          <Box sx={{ display: "flex", gap: "12px", flexWrap: "wrap", mb: 2 }}>
+            {[
+              [qdnSyncPrompt?.fromLabel, qdnSyncPrompt?.fromSummary],
+              [qdnSyncPrompt?.toLabel, qdnSyncPrompt?.toSummary],
+            ].map(([label, summary], index) => (
+              <Box
+                key={`${label || "summary"}-${index}`}
+                sx={{
+                  flex: "1 1 220px",
+                  border: "1px solid rgba(132, 162, 214, 0.35)",
+                  borderRadius: "8px",
+                  p: "10px",
+                }}
+              >
+                <Typography sx={{ fontSize: "13px", opacity: 0.76 }}>
+                  {label}
+                </Typography>
+                <Typography sx={{ fontSize: "14px" }}>
+                  Filesystem files: {summary?.fileSystem?.files ?? 0}
+                </Typography>
+                <Typography sx={{ fontSize: "14px" }}>
+                  Filesystem groups: {summary?.fileSystem?.groups ?? 0}
+                </Typography>
+                <Typography sx={{ fontSize: "14px" }}>
+                  Filesystem size: {summary?.fileSystem?.sizeLabel || "Unknown"}
+                </Typography>
+                <Typography sx={{ fontSize: "14px", mt: 1 }}>
+                  Private index entries: {summary?.privateIndex?.entries ?? 0}
+                </Typography>
+                <Typography sx={{ fontSize: "14px" }}>
+                  Private index size:{" "}
+                  {summary?.privateIndex?.sizeLabel || "Unknown"}
+                </Typography>
+              </Box>
+            ))}
+          </Box>
+          <Box
+            sx={{
+              border: "1px solid rgba(132, 162, 214, 0.35)",
+              borderRadius: "8px",
+              p: "10px",
+            }}
+          >
+            <Typography sx={{ fontSize: "14px", mb: 1 }}>
+              Detected changes
+            </Typography>
+            <Typography sx={{ fontSize: "13px", opacity: 0.76, mb: 0.5 }}>
+              Filesystem
+            </Typography>
+            <Typography sx={{ fontSize: "13px", opacity: 0.86 }}>
+              Added:{" "}
+              {formatChangeList(qdnSyncPrompt?.diff?.fileSystem?.added || [])}
+            </Typography>
+            <Typography sx={{ fontSize: "13px", opacity: 0.86 }}>
+              Removed:{" "}
+              {formatChangeList(qdnSyncPrompt?.diff?.fileSystem?.removed || [])}
+            </Typography>
+            <Typography sx={{ fontSize: "13px", opacity: 0.86 }}>
+              Changed:{" "}
+              {formatChangeList(qdnSyncPrompt?.diff?.fileSystem?.changed || [])}
+            </Typography>
+            <Typography
+              sx={{ fontSize: "13px", opacity: 0.76, mt: 1, mb: 0.5 }}
+            >
+              Private index
+            </Typography>
+            <Typography sx={{ fontSize: "13px", opacity: 0.86 }}>
+              Added:{" "}
+              {formatChangeList(qdnSyncPrompt?.diff?.privateIndex?.added || [])}
+            </Typography>
+            <Typography sx={{ fontSize: "13px", opacity: 0.86 }}>
+              Removed:{" "}
+              {formatChangeList(
+                qdnSyncPrompt?.diff?.privateIndex?.removed || []
+              )}
+            </Typography>
+            <Typography sx={{ fontSize: "13px", opacity: 0.86 }}>
+              Changed:{" "}
+              {formatChangeList(
+                qdnSyncPrompt?.diff?.privateIndex?.changed || []
+              )}
+            </Typography>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            variant="contained"
+            onClick={() => qdnSyncPrompt?.onCancel?.()}
+          >
+            Not now
+          </Button>
+          <Button
+            variant="contained"
+            onClick={() => qdnSyncPrompt?.onConfirm?.()}
+            autoFocus
+          >
+            {qdnSyncPrompt?.confirmLabel || "Continue"}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
-      {selectedFile && (
+      {resolvedSelectedFile && (
         <SelectedFile
           groups={groups}
           mode={mode}
-          selectedFile={selectedFile}
+          selectedFile={resolvedSelectedFile}
+          accountAddress={myAddress?.address}
+          accountPublicKey={myAddress?.publicKey}
           setSelectedFile={setSelectedFile}
           updateByPath={updateByPath}
+          myName={activePublishName || myAddress?.name?.name}
           selectedGroup={selectedGroup}
+          addNodeByPath={addNodeByPath}
         />
       )}
-      {previewFile && (
+      {resolvedPreviewFile && (
         <FilePreviewDialog
-          file={previewFile}
+          file={resolvedPreviewFile}
+          accountAddress={myAddress?.address}
+          accountPublicKey={myAddress?.publicKey}
+          onHydrateMetadata={(metadata) => {
+            if (!metadata || Object.keys(metadata).length === 0) return;
+            updateByPath({
+              ...resolvedPreviewFile,
+              ...metadata,
+            });
+            setPreviewFile((prev) => (prev ? { ...prev, ...metadata } : prev));
+            setSelectedFile((prev) => {
+              if (!prev) return prev;
+              if (
+                getNodeSelectionKey(prev) !== getNodeSelectionKey(previewFile)
+              ) {
+                return prev;
+              }
+              return { ...prev, ...metadata };
+            });
+          }}
           onClose={() => setPreviewFile(null)}
         />
       )}

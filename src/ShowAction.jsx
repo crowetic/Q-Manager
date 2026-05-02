@@ -14,11 +14,12 @@ import { PUBLISH_QDN_RESOURCE } from "./actions/PUBLISH_QDN_RESOURCE";
 import { PUBLISH_MULTIPLE_QDN_RESOURCES } from "./actions/PUBLISH_MULTIPLE_QDN_RESOURCES";
 import { OPEN_NEW_TAB } from "./actions/OPEN_NEW_TAB";
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
+/** @type {import('react').ForwardRefExoticComponent<import('@mui/material').SlideProps & { children: import('react').ReactElement<any, any> }>} */
 export const Transition = React.forwardRef(function Transition(props, ref) {
-  return <Slide direction="up" ref={ref} {...props} />;
+  return <Slide direction="up" ref={ref} {...props}>{props.children}</Slide>;
 });
 
-export const ShowAction = ({ selectedAction, handleClose, myName, addNodeByPath, mode , groups, selectedGroup, }) => {
+export const ShowAction = ({ selectedAction, handleClose, myName, accountAddress, accountPublicKey, addNodeByPath, mode , groups, selectedGroup, }) => {
   const ActionComponent = useMemo(() => {
     switch (selectedAction?.action) {
       
@@ -70,7 +71,7 @@ export const ShowAction = ({ selectedAction, handleClose, myName, addNodeByPath,
             overflowY: "auto",
           }}
         >
-          <ActionComponent myName={myName} addNodeByPath={addNodeByPath} mode={mode} groups={groups} selectedGroup={selectedGroup} files={selectedAction?.files || []}/>
+          <ActionComponent myName={myName} accountAddress={accountAddress} accountPublicKey={accountPublicKey} addNodeByPath={addNodeByPath} mode={mode} groups={groups} selectedGroup={selectedGroup} files={selectedAction?.files || []}/>
         </Box>
         {/* <LoadingSnackbar
           open={false}
