@@ -123,6 +123,7 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
   });
   const [isLoading, setIsLoading] = useState(false);
   const [response, setResponse] = useState("");
+  const ownerName = typeof myName === "string" ? myName : "";
 
   const { getRootProps, getInputProps } = useDropzone({
     multiple: true,
@@ -162,6 +163,8 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
       if (mode === "group" && !selectedGroup)
         throw new Error("Please select a group");
       if (!requestData?.service) throw new Error("Please select a service");
+      const resolvedOwnerName = await resolvePreferredName(ownerName);
+      if (!resolvedOwnerName) throw new Error("Could not determine Qortal name");
       setIsLoading(true);
 
       // 1) build resources array
@@ -242,6 +245,7 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
       // 2) send multi-publish request
       const result = await requestQortal({
         action: "PUBLISH_MULTIPLE_QDN_RESOURCES",
+        name: resolvedOwnerName,
         resources,
       });
 

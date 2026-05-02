@@ -128,6 +128,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
   });
   const [isLoading, setIsLoading] = useState(false);
   const [file, setFile] = useState(null);
+  const ownerName = typeof myName === "string" ? myName : "";
 
   const recordPrivateIndexEntry = async ({
     indexOwner,
@@ -177,6 +178,8 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
       try {
         if (!file) throw new Error('Please select a file')
         if (!requestData?.service) throw new Error("Please select a service")
+        const resolvedOwnerName = await resolvePreferredName(ownerName)
+        if (!resolvedOwnerName) throw new Error("Could not determine Qortal name")
         if(!selectedGroup) throw new Error('Please select a group')
         const findGroup = groups?.find((group)=> group.groupId === selectedGroup)
       if(!findGroup) throw new Error('Cannot find group')
@@ -302,6 +305,8 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
       try {
         if (!file) return;
         if (!requestData?.service) throw new Error("Please select a service")
+        const resolvedOwnerName = await resolvePreferredName(ownerName)
+        if (!resolvedOwnerName) throw new Error("Could not determine Qortal name")
         setIsLoading(true);
   
         const fileExtension = file?.name?.includes(".") ? file.name.split(".").pop() : "";
@@ -421,6 +426,10 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
       const promise = (async () => {
         if (!requestData?.service) {
           throw new Error("Please select a service");
+        }
+        const resolvedOwnerName = await resolvePreferredName(ownerName)
+        if (!resolvedOwnerName) {
+          throw new Error("Could not determine Qortal name");
         }
         const fileExtension = file?.name?.includes(".")
           ? file.name.split(".").pop()

@@ -2,6 +2,7 @@
 import {
   base64ToUint8Array,
   objectToBase64,
+  resolvePreferredName,
   uint8ArrayToObject,
 } from "./utils";
 import { privateServices, services } from "./constants";
@@ -612,6 +613,7 @@ export const publishFileSystemQManagerToQDN = async ({
 
   return requestQortal({
     action: "PUBLISH_QDN_RESOURCE",
+    name: resolvedName,
     service: "DOCUMENT_PRIVATE",
     identifier: QDN_STRUCTURE_IDENTIFIER,
     filename: QDN_STRUCTURE_FILENAME,

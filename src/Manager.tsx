@@ -72,6 +72,7 @@ import {
   base64ToUint8Array,
   handleImportClick,
   objectToBase64,
+  resolvePreferredName,
   uint8ArrayToObject,
 } from "./utils";
 import { openToast } from "./components/openToast";
@@ -1981,7 +1982,13 @@ const SortableItem = ({
   );
 };
 
-export const Manager = ({ myAddress, groups }) => {
+export const Manager = ({
+  myAddress,
+  groups,
+  ownedNames = [],
+  activeName = "",
+  onChangeActiveName,
+}) => {
   const [fileSystemPublic, setFileSystemPublic] = useState(null);
   const [fileSystemPrivate, setFileSystemPrivate] = useState(null);
   const [fileSystemGroup, setFileSystemGroup] = useState(
@@ -2775,7 +2782,7 @@ export const Manager = ({ myAddress, groups }) => {
 
   const discoverAndImportPublishedQManagerFiles = async () => {
     const promise = (async () => {
-      const ownerName = myAddress?.name?.name;
+      const ownerName = await resolvePreferredName(currentName, myAddress?.address);
       if (!ownerName) {
         throw new Error("Could not determine your Qortal name");
       }
@@ -4542,6 +4549,8 @@ export const Manager = ({ myAddress, groups }) => {
                           )
                         );
                       const promise = publishFileSystemQManagerToQDN({
+                        name: resolvedName,
+                        address: myAddress?.address,
                         fileSystemQManager: {
                           public: fileSystemPublic,
                           private: fileSystemPrivate,
@@ -4578,9 +4587,11 @@ export const Manager = ({ myAddress, groups }) => {
                   <Button
                     variant="contained"
                     onClick={async () => {
-                      const promise = importFileSystemQManagerFromQDN(
-                        myAddress?.name?.name
+                      const resolvedName = await resolvePreferredName(
+                        currentName,
+                        myAddress?.address
                       );
+                      const promise = importFileSystemQManagerFromQDN(resolvedName);
 
                       openToast(promise, {
                         loading: "Importing filesystem structure from QDN...",

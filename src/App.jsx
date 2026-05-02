@@ -28,6 +28,27 @@ function App() {
   const [myAddress, setMyaddress] = useState('')
   const [isLoading, setIsloading] = useState(true)
   const [groups, setGroups] = useState([])
+  const [ownedNames, setOwnedNames] = useState([])
+  const [activeName, setActiveName] = useState("")
+
+  const normalizeName = useCallback((entry) => {
+    if (typeof entry === "string") return entry.trim();
+    if (entry && typeof entry === "object" && typeof entry.name === "string") {
+      return entry.name.trim();
+    }
+    return "";
+  }, []);
+
+  const extractPrimaryName = useCallback((payload) => {
+    if (Array.isArray(payload)) {
+      for (const item of payload) {
+        const nameValue = normalizeName(item);
+        if (nameValue) return nameValue;
+      }
+      return "";
+    }
+    return normalizeName(payload);
+  }, [normalizeName]);
   const askForAccountInformation = useCallback(async () => {
     try {
       const account = await requestQortal({
@@ -45,7 +66,7 @@ function App() {
     } finally {
       setIsloading(false)
     }
-  }, []);
+  }, [extractPrimaryName, normalizeName]);
 
   const getGroups = useCallback(async (address) => {
     try {
@@ -71,6 +92,19 @@ function App() {
     }
   }, [myAddress?.address])
 
+  useEffect(() => {
+    if (!myAddress?.address) return;
+    setMyaddress((prev) => {
+      if (!prev?.address) return prev;
+      const nextName = activeName ? { name: activeName } : "";
+      if (prev?.name?.name === nextName?.name) return prev;
+      return {
+        ...prev,
+        name: nextName,
+      };
+    });
+  }, [activeName, myAddress?.address]);
+
 
   return (
     <ThemeProvider theme={theme}>
@@ -88,7 +122,7 @@ function App() {
         <CircularProgress />
         </Box>
       )}
-      {!isLoading && !myAddress?.name?.name && (
+      {!isLoading && !activeName && (
         <Box sx={{
           height: '100vh',
           width: '100vw',
@@ -104,8 +138,14 @@ function App() {
         </Box>
         
       )}
-      {!isLoading && myAddress?.name?.name && (
-        <Manager myAddress={myAddress} groups={groups} />
+      {!isLoading && !!activeName && (
+        <Manager
+          myAddress={myAddress}
+          groups={groups}
+          ownedNames={ownedNames}
+          activeName={activeName}
+          onChangeActiveName={setActiveName}
+        />
         )}
           <Toaster position="top-center"/>
     </div>
