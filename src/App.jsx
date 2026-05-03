@@ -55,11 +55,47 @@ function App() {
         action: "GET_USER_ACCOUNT",
       });
       if(account?.address){
+        let names = []
         const nameData = await requestQortal({
           action: "GET_ACCOUNT_NAMES",
           address: account.address,
         });
-        setMyaddress({...account, name: nameData[0] || "", names: nameData || []})
+        if (Array.isArray(nameData)) {
+          names = nameData.map((entry) => normalizeName(entry)).filter(Boolean);
+        } else {
+          const singleName = normalizeName(nameData);
+          if (singleName) {
+            names = [singleName];
+          }
+        }
+
+        let primaryName = "";
+        try {
+          const primaryNameData = await requestQortal({
+            action: "GET_PRIMARY_NAME",
+            address: account.address,
+          });
+          primaryName = extractPrimaryName(primaryNameData);
+        } catch (error) {
+          try {
+            const primaryNameData = await requestQortal({
+              action: "GET_PRIMARY_NAME",
+            });
+            primaryName = extractPrimaryName(primaryNameData);
+          } catch (innerError) {}
+        }
+
+        const resolvedName = primaryName || names[0] || "";
+        setOwnedNames(names);
+        setActiveName((prev) => {
+          if (prev && names.includes(prev)) return prev;
+          return resolvedName;
+        });
+        setMyaddress({
+          ...account,
+          name: resolvedName ? { name: resolvedName } : "",
+          names: names.map((name) => ({ name })),
+        })
       }
     } catch (error) {
       console.error(error);
@@ -105,6 +141,9 @@ function App() {
     });
   }, [activeName, myAddress?.address]);
 
+  const resolvedActiveName =
+    activeName || myAddress?.name?.name || ownedNames[0] || "";
+
 
   return (
     <ThemeProvider theme={theme}>
@@ -122,7 +161,7 @@ function App() {
         <CircularProgress />
         </Box>
       )}
-      {!isLoading && !activeName && (
+      {!isLoading && !resolvedActiveName && (
         <Box sx={{
           height: '100vh',
           width: '100vw',
@@ -138,12 +177,12 @@ function App() {
         </Box>
         
       )}
-      {!isLoading && !!activeName && (
+      {!isLoading && !!resolvedActiveName && (
         <Manager
           myAddress={myAddress}
           groups={groups}
           ownedNames={ownedNames}
-          activeName={activeName}
+          activeName={resolvedActiveName}
           onChangeActiveName={setActiveName}
         />
         )}

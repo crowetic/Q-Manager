@@ -9,12 +9,17 @@ import {
   styled,
 } from "@mui/material";
 import ShortUniqueId from "short-unique-id";
-import { fileToBase64, objectToBase64 } from "../utils";
+import {
+  createImageThumbnailData64,
+  fileToBase64,
+  objectToBase64,
+} from "../utils";
 import { openToast } from "../components/openToast";
 import Button from "../components/Button";
 import { privateServices, services } from "../constants";
 import { useDropzone } from "react-dropzone"; 
 import { requestQortal } from "../qapp/request";
+import { resolvePreferredName } from "../utils";
 import { upsertPrivateResourceIndexEntry } from "../storage";
 
 const uid = new ShortUniqueId({ length: 10 });
@@ -124,6 +129,9 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
   const [isLoading, setIsLoading] = useState(false);
   const [response, setResponse] = useState("");
   const ownerName = typeof myName === "string" ? myName : "";
+  const isImageFile = (candidate) =>
+    typeof candidate?.type === "string" &&
+    candidate.type.toLowerCase().startsWith("image/");
 
   const { getRootProps, getInputProps } = useDropzone({
     multiple: true,
@@ -172,7 +180,12 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
       const publishedItems = [];
       for (const file of files) {
         const { filename, identifier } = makeMeta(file);
-        const data64 = await fileToBase64(file);
+        const [data64, thumbnail] = await Promise.all([
+          fileToBase64(file),
+          mode !== "public" && isImageFile(file)
+            ? createImageThumbnailData64(file, file?.type || "image/png")
+            : Promise.resolve(null),
+        ]);
         const mimeType = file?.type || "application/octet-stream";
         const sizeInBytes = Number(file?.size) || 0;
         const publishedItem = {
@@ -181,6 +194,12 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
           identifier,
           mimeType,
           sizeInBytes,
+          ...(thumbnail?.data64
+            ? {
+                thumbnailData64: thumbnail.data64,
+                thumbnailMimeType: thumbnail.mimeType,
+              }
+            : {}),
         };
         publishedItems.push(publishedItem);
 
@@ -296,6 +315,12 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
             encryptionType: mode === "group" ? "group" : "private",
             ...(item.sharingKey ? { sharingKey: item.sharingKey } : {}),
             ...(item.publicKey ? { publicKey: item.publicKey } : {}),
+            ...(item.thumbnailData64
+              ? {
+                  thumbnailData64: item.thumbnailData64,
+                  thumbnailMimeType: item.thumbnailMimeType || "image/jpeg",
+                }
+              : {}),
             ...(mode === "group"
               ? {
                   group: selectedGroup,

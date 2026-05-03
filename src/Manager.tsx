@@ -11,12 +11,10 @@ import {
 } from "@dnd-kit/core";
 import {
   SortableContext,
-  arrayMove,
   sortableKeyboardCoordinates,
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import SaveAltIcon from "@mui/icons-material/SaveAlt";
 import {
   Button,
   ButtonBase,
@@ -65,11 +63,13 @@ import { Spacer } from "./components/Spacer";
 import FolderIcon from "@mui/icons-material/Folder";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
 import CreateNewFolderIcon from "@mui/icons-material/CreateNewFolder";
-import InsertDriveFileIcon from "@mui/icons-material/InsertDriveFile";
+import PublishIcon from "@mui/icons-material/Publish";
+import SettingsOutlinedIcon from "@mui/icons-material/SettingsOutlined";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import NotificationsActiveOutlinedIcon from "@mui/icons-material/NotificationsActiveOutlined";
 import {
   base64ToUint8Array,
+  createImageThumbnailData64,
   handleImportClick,
   objectToBase64,
   resolvePreferredName,
@@ -407,6 +407,8 @@ const inferPreviewKindFromMimeType = (mimeType) => {
   if (normalized.startsWith("image/")) return "image";
   if (normalized.startsWith("video/")) return "video";
   if (normalized.startsWith("audio/")) return "audio";
+  if (normalized === "application/pdf" || normalized === "application/x-pdf")
+    return "pdf";
   if (isTextLikeMimeType(normalized)) return "text";
   return "";
 };
@@ -514,9 +516,12 @@ const resolvePrivateResourceItem = (item, privateResourceIndex) => {
     item?.name ||
     item?.filename ||
     "";
+  const resolvedQortalName =
+    privateIndexEntry?.qortalName || item?.qortalName || "";
 
   return {
     ...item,
+    ...(resolvedQortalName ? { qortalName: resolvedQortalName } : {}),
     ...(resolvedDisplayName ? { displayName: resolvedDisplayName } : {}),
     ...(resolvedFilename ? { filename: resolvedFilename } : {}),
     ...(privateIndexEntry?.mimeType
@@ -538,6 +543,18 @@ const resolvePrivateResourceItem = (item, privateResourceIndex) => {
     ...(privateIndexEntry?.key ? { key: privateIndexEntry.key } : {}),
     ...(privateIndexEntry?.publicKey || item?.publicKey
       ? { publicKey: privateIndexEntry?.publicKey || item?.publicKey }
+      : {}),
+    ...(privateIndexEntry?.thumbnailData64 || item?.thumbnailData64
+      ? {
+          thumbnailData64:
+            privateIndexEntry?.thumbnailData64 || item?.thumbnailData64,
+          thumbnailMimeType:
+            privateIndexEntry?.thumbnailMimeType ||
+            item?.thumbnailMimeType ||
+            privateIndexEntry?.mimeType ||
+            item?.mimeType ||
+            "image/jpeg",
+        }
       : {}),
     ...(privateIndexEntry?.group !== undefined ||
     privateIndexEntry?.groupId !== undefined ||
@@ -739,6 +756,53 @@ const cachePrivatePreviewHints = async (
   } catch (error) {}
 };
 
+const cachePrivatePreviewThumbnail = async (
+  file,
+  accountAddress,
+  data64,
+  mimeType,
+  privateIndexEntry = null,
+  options = {}
+) => {
+  if (!accountAddress || !isEncryptedResource(file)) return;
+  if (!data64 || typeof data64 !== "string") return;
+  const force = options?.force === true;
+  const normalizedMimeType = inferPreviewKindFromMimeType(mimeType) === "image"
+    ? mimeType
+    : "";
+  if (!normalizedMimeType) return;
+  if (!force && privateIndexEntry?.thumbnailData64) return;
+
+  try {
+    const thumbnail = await createImageThumbnailData64(
+      data64,
+      normalizedMimeType,
+      {
+        maxWidth: 160,
+        maxHeight: 160,
+        outputMimeType: "image/jpeg",
+        quality: 0.82,
+      }
+    );
+
+    if (!thumbnail?.data64) return;
+
+    await upsertPrivateResourceIndexEntry(accountAddress, {
+      resourceKey: [
+        file?.qortalName || "",
+        getServiceName(file) || "",
+        file?.identifier || "",
+        file?.group || file?.groupId || 0,
+      ].join("|"),
+      qortalName: file?.qortalName || "",
+      service: getServiceName(file),
+      identifier: file?.identifier,
+      thumbnailData64: thumbnail.data64,
+      thumbnailMimeType: thumbnail.mimeType || "image/jpeg",
+    });
+  } catch (error) {}
+};
+
 const fetchResourceBase64 = async (file, signal) => {
   const previewUrl = getResourcePreviewUrl(file);
   if (!previewUrl) throw new Error("Preview unavailable for this file");
@@ -847,8 +911,10 @@ const fetchPreviewPayload = async (
   file,
   signal,
   accountAddress,
-  accountPublicKey = ""
+  accountPublicKey = "",
+  options = {}
 ) => {
+  const cacheThumbnail = options?.cacheThumbnail !== false;
   const data = await fetchResourceBase64(file, signal);
   if (!isEncryptedResource(file)) {
     return {
@@ -895,6 +961,23 @@ const fetchPreviewPayload = async (
       },
       privateIndexEntry
     );
+    const rawPayloadMimeType =
+      rawPayload.metadata?.mimeType ||
+      hints?.mimeType ||
+      inferMimeTypeFromBase64(rawPayload.data64);
+    if (
+      cacheThumbnail &&
+      inferPreviewKindFromMimeType(rawPayloadMimeType) === "image"
+    ) {
+      await cachePrivatePreviewThumbnail(
+        file,
+        accountAddress,
+        rawPayload.data64,
+        rawPayloadMimeType,
+        privateIndexEntry,
+        { force: true }
+      );
+    }
     return rawPayload;
   }
 
@@ -913,10 +996,27 @@ const fetchPreviewPayload = async (
     },
     privateIndexEntry
   );
+  const decryptedPayloadMimeType =
+    decrypted.metadata?.mimeType ||
+    hints?.mimeType ||
+    inferMimeTypeFromBase64(decrypted.data64);
+  if (
+    cacheThumbnail &&
+    inferPreviewKindFromMimeType(decryptedPayloadMimeType) === "image"
+  ) {
+    await cachePrivatePreviewThumbnail(
+      file,
+      accountAddress,
+      decrypted.data64,
+      decryptedPayloadMimeType,
+      privateIndexEntry,
+      { force: true }
+    );
+  }
   return {
-    data64: decrypted.data64,
-    metadata: sanitizePreviewMetadata({
-      ...hints,
+      data64: decrypted.data64,
+      metadata: sanitizePreviewMetadata({
+        ...hints,
       ...(decrypted.metadata || {}),
     }),
   };
@@ -1031,6 +1131,7 @@ const inferMimeTypeFromExtension = (extension) => {
     bmp: "image/bmp",
     svg: "image/svg+xml",
     avif: "image/avif",
+    pdf: "application/pdf",
     mp4: "video/mp4",
     webm: "video/webm",
     m4v: "video/x-m4v",
@@ -1075,6 +1176,10 @@ const inferPreviewKind = (file) => {
     TEXT_PREVIEW_EXTENSIONS.has(extension)
   )
     return "text";
+
+  if (effectiveMime === "application/pdf" || extension === "pdf") {
+    return "pdf";
+  }
 
   if (
     service.includes("IMAGE") ||
@@ -1213,6 +1318,61 @@ const collectFileSystemEntries = (tree, scope, entries = []) => {
   return entries;
 };
 
+const collectFileSystemStructureEntries = (tree, scope, entries = []) => {
+  const walk = (nodes, path = []) => {
+    if (!Array.isArray(nodes)) return;
+    for (const node of nodes) {
+      if (!node) continue;
+
+      const nodeName = node.name || "";
+      const nextPath = [...path, nodeName].filter(Boolean);
+      const normalizedNode = (() => {
+        if (!node || typeof node !== "object") return {};
+        const { children, ...rest } = node;
+        return rest;
+      })();
+
+      if (node.type === "folder") {
+        const childDescriptors = Array.isArray(node.children)
+          ? node.children.map((child) => ({
+              type: child?.type || "",
+              name: child?.name || "",
+              identifier: child?.identifier || "",
+              service: child?.service || "",
+              group: child?.group || child?.groupId || 0,
+            }))
+          : [];
+
+        entries.push({
+          key: `${scope}|${nextPath.join("/") || nodeName || "root"}`,
+          scope,
+          label: `${scope}: ${nodeName || "Folder"}`,
+          serialized: stableStringify({
+            ...normalizedNode,
+            children: childDescriptors,
+          }),
+          size: 0,
+        });
+      } else {
+        entries.push({
+          key: `${scope}|${nextPath.join("/") || nodeName || "root"}`,
+          scope,
+          label: `${scope}: ${getFileSummaryName(node)}`,
+          serialized: stableStringify(normalizedNode),
+          size: getItemSizeBytes(node),
+        });
+      }
+
+      if (Array.isArray(node.children)) {
+        walk(node.children, nextPath);
+      }
+    }
+  };
+
+  walk(tree);
+  return entries;
+};
+
 const collectSnapshotEntries = (snapshot) => {
   const entries = [];
   collectFileSystemEntries(snapshot?.public, "public", entries);
@@ -1221,6 +1381,18 @@ const collectSnapshotEntries = (snapshot) => {
     snapshot?.group && !Array.isArray(snapshot.group) ? snapshot.group : {};
   for (const [groupId, tree] of Object.entries(groups)) {
     collectFileSystemEntries(tree, `group ${groupId}`, entries);
+  }
+  return entries;
+};
+
+const collectSnapshotStructureEntries = (snapshot) => {
+  const entries = [];
+  collectFileSystemStructureEntries(snapshot?.public, "public", entries);
+  collectFileSystemStructureEntries(snapshot?.private, "private", entries);
+  const groups =
+    snapshot?.group && !Array.isArray(snapshot.group) ? snapshot.group : {};
+  for (const [groupId, tree] of Object.entries(groups)) {
+    collectFileSystemStructureEntries(tree, `group ${groupId}`, entries);
   }
   return entries;
 };
@@ -1358,8 +1530,8 @@ const diffEntries = (fromEntries, toEntries) => {
 
 const diffFileSystemSnapshots = (fromSnapshot, toSnapshot) =>
   diffEntries(
-    collectSnapshotEntries(fromSnapshot),
-    collectSnapshotEntries(toSnapshot)
+    collectSnapshotStructureEntries(fromSnapshot),
+    collectSnapshotStructureEntries(toSnapshot)
   );
 
 const diffPrivateIndexSnapshots = (fromSnapshot, toSnapshot) =>
@@ -1413,6 +1585,8 @@ const FilePreviewDialog = ({
   const [textPreview, setTextPreview] = useState("");
   const [textPreviewLoading, setTextPreviewLoading] = useState(false);
   const [textPreviewError, setTextPreviewError] = useState("");
+  const noMetadataPreviewMessage =
+    "We do not have enough metadata for this file to preview it.";
 
   useEffect(() => {
     setPreviewError(false);
@@ -1465,18 +1639,14 @@ const FilePreviewDialog = ({
         setResolvedMimeType(payloadMimeType);
         setResolvedPreviewKind(payloadKind || "unknown");
 
-        if (payloadKind === "text") {
-          setTextPreview(trimForTextPreview(decodeBase64Utf8(payload.data64)));
+        if (!payloadKind) {
+          setPreviewError(true);
+          setPreviewErrorMessage(noMetadataPreviewMessage);
           return;
         }
 
-        if (!["image", "video", "audio"].includes(payloadKind)) {
-          setPreviewError(true);
-          setPreviewErrorMessage(
-            payloadMimeType
-              ? `Could not render preview as ${payloadMimeType}.`
-              : "Could not render preview."
-          );
+        if (payloadKind === "text") {
+          setTextPreview(trimForTextPreview(decodeBase64Utf8(payload.data64)));
           return;
         }
 
@@ -1508,7 +1678,13 @@ const FilePreviewDialog = ({
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [previewResourceKey, encrypted, previewUrl, accountAddress]);
+  }, [
+    previewResourceKey,
+    encrypted,
+    previewUrl,
+    accountAddress,
+    accountPublicKey,
+  ]);
 
   useEffect(() => {
     if (!file || encrypted || previewKind !== "text" || !previewUrl) {
@@ -1622,6 +1798,25 @@ const FilePreviewDialog = ({
           </Typography>
         )}
         {!!previewUrl &&
+          effectivePreviewKind === "pdf" &&
+          !!mediaPreviewUrl &&
+          !previewError && (
+            <Box
+              component="object"
+              data={mediaPreviewUrl}
+              type={resolvedMimeType || "application/pdf"}
+              sx={{
+                width: "100%",
+                height: "70vh",
+                maxHeight: "70vh",
+                borderRadius: "8px",
+                backgroundColor: "rgba(0,0,0,0.2)",
+              }}
+            >
+              <Typography sx={{ p: 2 }}>Could not render PDF preview.</Typography>
+            </Box>
+          )}
+        {!!previewUrl &&
           effectivePreviewKind === "video" &&
           !!mediaPreviewUrl &&
           !previewError && (
@@ -1688,15 +1883,6 @@ const FilePreviewDialog = ({
             )}
           </>
         )}
-        {!!previewUrl &&
-          (effectivePreviewKind === "unknown" ||
-            (effectivePreviewKind !== "text" && previewError)) &&
-          !previewLoading && (
-            <Typography>
-              Could not preview this resource inline. It may not be a supported
-              media type.
-            </Typography>
-          )}
       </DialogContent>
       <DialogActions>
         <Button variant="contained" onClick={onClose}>
@@ -1710,6 +1896,7 @@ const FilePreviewDialog = ({
 const SortableItem = ({
   item,
   onClick,
+  onSelect,
   removeFile,
   removeDirectory,
   rename,
@@ -1717,7 +1904,6 @@ const SortableItem = ({
   moveNode,
   currentPath,
   selected,
-  onToggleSelect,
   onPreview,
   showThumbnails,
   showPrivateThumbnails,
@@ -1725,6 +1911,7 @@ const SortableItem = ({
   onTogglePin,
   accountAddress,
   accountPublicKey,
+  privateThumbnailAttemptedRef,
 }) => {
   const sortableId = getNodeSelectionKey(item);
   const { attributes, listeners, setNodeRef, transform, transition } =
@@ -1739,10 +1926,17 @@ const SortableItem = ({
   const encrypted = isEncryptedResource(item);
   const shouldShowThumbnail =
     item?.type === "file" &&
-    previewKind === "image" &&
     (encrypted ? showPrivateThumbnails : showThumbnails);
   const thumbnailUrl =
-    shouldShowThumbnail && !encrypted ? getResourcePreviewUrl(item) : "";
+    shouldShowThumbnail && !encrypted && previewKind === "image"
+      ? getResourcePreviewUrl(item)
+      : "";
+  const privateThumbnailMimeType =
+    item?.thumbnailMimeType || item?.mimeType || "image/jpeg";
+  const cachedPrivateThumbnailUrl =
+    shouldShowThumbnail && encrypted && item?.thumbnailData64
+      ? `data:${privateThumbnailMimeType};base64,${item.thumbnailData64}`
+      : "";
 
   useEffect(() => {
     setThumbnailError(false);
@@ -1750,6 +1944,10 @@ const SortableItem = ({
     item?.identifier,
     item?.service,
     item?.qortalName,
+    item?.thumbnailData64,
+    item?.thumbnailMimeType,
+    accountAddress,
+    accountPublicKey,
     showThumbnails,
     showPrivateThumbnails,
   ]);
@@ -1758,11 +1956,20 @@ const SortableItem = ({
     setDecryptedThumbnailUrl("");
     setThumbnailLoading(false);
 
-    if (!shouldShowThumbnail || !encrypted) return;
+    if (!shouldShowThumbnail) return;
+    if (!encrypted) return;
+    if (cachedPrivateThumbnailUrl) return;
+
+    const attemptedSet = privateThumbnailAttemptedRef?.current;
+    const cacheKey = [
+      getFileIdentity(item),
+      accountPublicKey || "",
+    ].join("|");
+    if (attemptedSet?.has(cacheKey)) return;
+    attemptedSet?.add(cacheKey);
 
     const controller = new AbortController();
     let disposed = false;
-    let objectUrl = "";
 
     const loadThumbnail = async () => {
       setThumbnailLoading(true);
@@ -1771,18 +1978,41 @@ const SortableItem = ({
           item,
           controller.signal,
           accountAddress,
-          accountPublicKey
+          accountPublicKey,
+          { cacheThumbnail: false }
         );
         if (disposed) return;
-        objectUrl = URL.createObjectURL(
-          base64ToBlob(
-            payload.data64,
-            payload?.metadata?.mimeType ||
-              item?.mimeType ||
-              inferMimeTypeFromExtension(getFileExtension(item))
-          )
+        const thumbnailMimeType =
+          payload?.metadata?.mimeType ||
+          item?.mimeType ||
+          inferMimeTypeFromExtension(getFileExtension(item)) ||
+          inferMimeTypeFromBase64(payload.data64);
+        if (inferPreviewKindFromMimeType(thumbnailMimeType) !== "image") {
+          return;
+        }
+        const thumbnail = await createImageThumbnailData64(
+          payload.data64,
+          thumbnailMimeType || "image/png",
+          {
+            maxWidth: 160,
+            maxHeight: 160,
+            outputMimeType: "image/jpeg",
+            quality: 0.82,
+          }
         );
-        setDecryptedThumbnailUrl(objectUrl);
+        if (disposed || controller.signal.aborted) return;
+        if (!thumbnail?.data64) return;
+        await upsertPrivateResourceIndexEntry(accountAddress, {
+          resourceKey: getFileIdentity(item),
+          qortalName: item?.qortalName || "",
+          service: getServiceName(item),
+          identifier: item?.identifier,
+          thumbnailData64: thumbnail.data64,
+          thumbnailMimeType: thumbnail.mimeType || "image/jpeg",
+        });
+        setDecryptedThumbnailUrl(
+          `data:${thumbnail.mimeType || "image/jpeg"};base64,${thumbnail.data64}`
+        );
       } catch (error) {
         if (!controller.signal.aborted && !disposed) {
           setThumbnailError(true);
@@ -1799,12 +2029,23 @@ const SortableItem = ({
     return () => {
       disposed = true;
       controller.abort();
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [item, shouldShowThumbnail, encrypted, accountAddress]);
+  }, [
+    item?.identifier,
+    item?.service,
+    item?.qortalName,
+    item?.mimeType,
+    item?.thumbnailData64,
+    shouldShowThumbnail,
+    encrypted,
+    accountAddress,
+    accountPublicKey,
+    cachedPrivateThumbnailUrl,
+    privateThumbnailAttemptedRef,
+  ]);
 
   const effectiveThumbnailUrl = encrypted
-    ? decryptedThumbnailUrl
+    ? cachedPrivateThumbnailUrl || decryptedThumbnailUrl
     : thumbnailUrl;
 
   useEffect(() => {
@@ -1864,16 +2105,20 @@ const SortableItem = ({
             transform: "translateY(-2px)",
           },
         }}
-        onClick={() => {
+        onClick={(event) => {
           if (item?.type !== "file") {
-            onClick();
+            onClick?.(event);
             return;
           }
           if (clickTimeoutRef.current) {
             clearTimeout(clickTimeoutRef.current);
           }
+          if (event?.shiftKey || event?.metaKey || event?.ctrlKey) {
+            onSelect?.(event);
+            return;
+          }
           clickTimeoutRef.current = setTimeout(() => {
-            onClick();
+            onClick?.(event);
             clickTimeoutRef.current = null;
           }, 220);
         }}
@@ -1892,10 +2137,16 @@ const SortableItem = ({
           <Checkbox
             checked={selected}
             size="small"
+            onPointerDown={(event) => {
+              event.stopPropagation();
+            }}
+            onMouseDown={(event) => {
+              event.stopPropagation();
+            }}
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              onToggleSelect?.();
+              onSelect?.(event);
             }}
             sx={{
               position: "absolute",
@@ -2093,10 +2344,13 @@ export const Manager = ({
   const { isShow, onCancel, onOk, show, type } = useModal();
   const [newDirName, setNewDirName] = useState("");
   const [newName, setNewName] = useState("");
+  const newDirInputRef = useRef(null);
 
   const [selectedFile, setSelectedFile] = useState(null);
   const [previewFile, setPreviewFile] = useState(null);
   const [selectedFileKeys, setSelectedFileKeys] = useState([]);
+  const selectionAnchorKeyRef = useRef("");
+  const privateThumbnailAttemptedRef = useRef(new Set());
   const [showThumbnails, setShowThumbnails] = useState(() => {
     try {
       return localStorage.getItem(SHOW_THUMBNAILS_KEY) === "1";
@@ -2122,10 +2376,9 @@ export const Manager = ({
   const [showBulkMoveModal, setShowBulkMoveModal] = useState(false);
   const [bulkMoveTargetPath, setBulkMoveTargetPath] = useState([]);
   const [qdnSyncPrompt, setQdnSyncPrompt] = useState(null);
-  const [qdnPublishNoticeVisible, setQdnPublishNoticeVisible] = useState(false);
+  const [qdnBackupDirty, setQdnBackupDirty] = useState(false);
   const fileSystemLoadedRef = useRef(false);
   const skipNextQdnPublishPromptRef = useRef(true);
-  const qdnPublishPromptTimerRef = useRef(null);
   const qdnPublishPromptRef = useRef(null);
   const lastQdnSyncedSnapshotRef = useRef("");
   const dismissedPublishSnapshotRef = useRef("");
@@ -2157,6 +2410,17 @@ export const Manager = ({
   }, [activePublishName, myAddress?.name?.name]);
 
   useEffect(() => {
+    if (isShow && type === "new-directory") {
+      const timer = setTimeout(() => {
+        newDirInputRef.current?.focus?.();
+        newDirInputRef.current?.select?.();
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+    return undefined;
+  }, [isShow, type]);
+
+  useEffect(() => {
     setSelectedFileKeys([]);
   }, [mode, selectedGroup]);
 
@@ -2186,7 +2450,7 @@ export const Manager = ({
 
   const showPublishNotice = (prompt) => {
     qdnPublishPromptRef.current = prompt;
-    setQdnPublishNoticeVisible(true);
+    setQdnBackupDirty(true);
   };
 
   const openPublishPrompt = () => {
@@ -2196,7 +2460,7 @@ export const Manager = ({
 
   const clearPublishNotice = () => {
     qdnPublishPromptRef.current = null;
-    setQdnPublishNoticeVisible(false);
+    setQdnBackupDirty(false);
   };
 
   const handleNavigate = (folderName) => {
@@ -2217,7 +2481,7 @@ export const Manager = ({
       checkedQdnLoadRef.current = false;
       setQdnFileSystemLoadReady(false);
       setQdnSyncPrompt(null);
-      setQdnPublishNoticeVisible(false);
+      setQdnBackupDirty(false);
       qdnPublishPromptRef.current = null;
       const data = await getPersistedFileSystemQManager(myAddress?.address);
       const currentPrivateResourceIndex = await getPersistedPrivateResourceIndex(
@@ -2257,21 +2521,14 @@ export const Manager = ({
         setFileSystemGroup(initialGroupFileSystem);
       }
       fileSystemLoadedRef.current = true;
-      skipNextQdnPublishPromptRef.current = true;
-      dismissedPublishSnapshotRef.current = stableStringify(
-        normalizeQdnSyncPayloadForComparison(loadedPayload)
-      );
       setQdnFileSystemLoadReady(true);
     };
     fetchFileSystem();
   }, [myAddress?.address]);
 
   useEffect(() => {
-    if (
-      !myAddress?.name?.name ||
-      !qdnFileSystemLoadReady ||
-      checkedQdnLoadRef.current
-    ) {
+    const qdnOwnerNameCandidate = activePublishName || myAddress?.name?.name;
+    if (!qdnOwnerNameCandidate || !qdnFileSystemLoadReady || checkedQdnLoadRef.current) {
       return;
     }
 
@@ -2279,8 +2536,15 @@ export const Manager = ({
     checkedQdnLoadRef.current = true;
     const loadPublishedFileSystem = async () => {
       try {
+        const qdnOwnerName =
+          (await resolvePreferredName(
+            activePublishName || myAddress?.name?.name,
+            myAddress?.address
+          )) || myAddress?.name?.name;
+        if (!qdnOwnerName) return;
+
         const imported = await importFileSystemQManagerFromQDN(
-          myAddress.name.name
+          qdnOwnerName
         );
         if (disposed || !imported?.public || !imported?.private) return;
 
@@ -2414,122 +2678,16 @@ export const Manager = ({
           }
         );
 
-        if (!autoQdnFileSystemSync && skipNextQdnPublishPromptRef.current) {
+        if (skipNextQdnPublishPromptRef.current) {
           skipNextQdnPublishPromptRef.current = false;
+          return;
         }
 
-        if (
-          autoQdnFileSystemSync &&
-          myAddress?.name?.name &&
-          fileSystemLoadedRef.current
-        ) {
-          if (skipNextQdnPublishPromptRef.current) {
-            skipNextQdnPublishPromptRef.current = false;
-            return;
-          }
-
-          const currentSnapshot = stableStringify(
-            normalizeQdnSyncPayloadForComparison({
-              public: fileSystemPublic,
-              private: fileSystemPrivate,
-              group: fileSystemGroup,
-              ...(privateResourceIndex ? { privateResourceIndex } : {}),
-            })
-          );
-          const baselineSnapshot = lastQdnSyncedSnapshotRef.current;
-          if (
-            !baselineSnapshot ||
-            currentSnapshot === baselineSnapshot ||
-            currentSnapshot === dismissedPublishSnapshotRef.current
-          ) {
-            return;
-          }
-
-          if (qdnPublishPromptTimerRef.current) {
-            clearTimeout(qdnPublishPromptTimerRef.current);
-          }
-
-          qdnPublishPromptTimerRef.current = setTimeout(() => {
-            const baselinePayload = (() => {
-              try {
-                return JSON.parse(baselineSnapshot);
-              } catch (error) {
-                return null;
-              }
-            })();
-            const diff = diffQdnSyncPayload(baselinePayload, payload);
-            if (!diff.hasChanges) return;
-
-            const publishPrompt = {
-              type: "publish",
-              title: "Publish Filesystem Backup Update?",
-              intro:
-                "Your local Q-Manager filesystem differs from the last QDN backup.",
-              fromLabel: "Last QDN backup",
-              toLabel: "Current local",
-              fromSummary: summarizeQdnSyncPayload(baselinePayload),
-              toSummary: summarizeQdnSyncPayload(payload),
-              diff,
-              confirmLabel: "Publish update",
-              onConfirm: async () => {
-                try {
-                  const publishPromise = publishFileSystemQManagerToQDN({
-                    fileSystemQManager: {
-                      public: fileSystemPublic,
-                      private: fileSystemPrivate,
-                      group: fileSystemGroup,
-                    },
-                    privateResourceIndex,
-                    activePublishName:
-                      activePublishName || myAddress?.name?.name,
-                  });
-
-                  openToast(publishPromise, {
-                    loading: "Publishing filesystem structure to QDN...",
-                    success: "Filesystem structure published to QDN",
-                    error: (err) =>
-                      `Publish failed: ${err?.error || err?.message || err}`,
-                  });
-                  await publishPromise;
-                  lastQdnSyncedSnapshotRef.current = currentSnapshot;
-                  dismissedPublishSnapshotRef.current = "";
-                  clearPublishNotice();
-                } catch (error) {
-                  console.error(
-                    "Failed to publish filesystem backup update:",
-                    error
-                  );
-                } finally {
-                  setQdnSyncPrompt(null);
-                }
-              },
-              onCancel: () => {
-                dismissedPublishSnapshotRef.current = currentSnapshot;
-                setQdnSyncPrompt(null);
-              },
-            };
-
-            showPublishNotice(publishPrompt);
-          }, 1500);
-        }
+        queueQdnPublishPrompt(payload);
       };
 
       syncFilesystemState();
-
-      return () => {
-        if (qdnPublishPromptTimerRef.current) {
-          clearTimeout(qdnPublishPromptTimerRef.current);
-          qdnPublishPromptTimerRef.current = null;
-        }
-      };
     }
-
-    return () => {
-      if (qdnPublishPromptTimerRef.current) {
-        clearTimeout(qdnPublishPromptTimerRef.current);
-        qdnPublishPromptTimerRef.current = null;
-      }
-    };
   }, [
     fileSystemPublic,
     fileSystemPrivate,
@@ -2582,20 +2740,18 @@ export const Manager = ({
       });
 
       setFileSystem(updatedFileSystem); // Update the state
+      queueQdnPublishPrompt(
+        buildQdnSyncPayload({ updatedTree: updatedFileSystem })
+      );
       return true;
     }
 
     return false; // Current directory not found
   };
 
-  const addNodeByPath = (
-    pathArray = currentPath,
-    newNode,
-    nodes = fileSystem
-  ) => {
+  const addNodeByPath = (pathArray = currentPath, newNode) => {
     if (pathArray.length === 0) return false;
-
-    const updatedFileSystem = JSON.parse(JSON.stringify(nodes)); // Deep copy to avoid mutating state
+    const updatedFileSystem = JSON.parse(JSON.stringify(fileSystem)); // Deep copy to avoid mutating state
     const target = pathArray[pathArray.length - 1]; // Last item is the target directory
     const parents = pathArray.slice(0, -1); // All but the last item are parent directories
 
@@ -2614,25 +2770,26 @@ export const Manager = ({
     const targetNode = currentNodes.find(
       (node) => node.name === target && node.type === "folder"
     );
-    if (targetNode) {
-      targetNode.children = targetNode.children || [];
+    if (!targetNode) return false; // Target directory not found
 
-      // Ensure unique name for the new node based on type
-      const existingNames = targetNode.children
-        .filter((child) => child.type === newNode.type) // Only check for conflicts within the same type
-        .map((child) => child.name);
+    targetNode.children = targetNode.children || [];
 
-      newNode.name = ensureUniqueName(newNode.name, existingNames);
-      if (newNode.type === "file" && !newNode.displayName) {
-        newNode.displayName = newNode.name;
-      }
+    // Ensure unique name for the new node based on type
+    const existingNames = targetNode.children
+      .filter((child) => child.type === newNode.type) // Only check for conflicts within the same type
+      .map((child) => child.name);
 
-      targetNode.children.push(newNode);
-      setFileSystem(updatedFileSystem); // Update the state
-      return true;
+    const nextNode = { ...newNode };
+    nextNode.name = ensureUniqueName(nextNode.name, existingNames);
+    if (nextNode.type === "file" && !nextNode.displayName) {
+      nextNode.displayName = nextNode.name;
     }
 
-    return false; // Target directory not found
+    targetNode.children.push(nextNode);
+    setFileSystem(updatedFileSystem);
+    queueQdnPublishPrompt(buildQdnSyncPayload({ updatedTree: updatedFileSystem }));
+
+    return true;
   };
 
   const removeByNodePath = async (
@@ -2670,10 +2827,10 @@ export const Manager = ({
       );
       if (fileIndex !== -1) {
         targetFolderNode.children.splice(fileIndex, 1); // Remove the file from the children array
-        const snapshot = buildQdnSyncSnapshot(updatedFileSystem);
-        lastQdnSyncedSnapshotRef.current = snapshot;
-        dismissedPublishSnapshotRef.current = snapshot;
         setFileSystem(updatedFileSystem);
+        queueQdnPublishPrompt(
+          buildQdnSyncPayload({ updatedTree: updatedFileSystem })
+        );
         return true;
       }
 
@@ -2968,10 +3125,16 @@ export const Manager = ({
         if (type === "file") {
           targetNode.displayName = newName;
           setFileSystem(updatedFileSystem);
+          queueQdnPublishPrompt(
+            buildQdnSyncPayload({ updatedTree: updatedFileSystem })
+          );
           return true;
         }
         targetNode.name = newName; // Update the name
         setFileSystem(updatedFileSystem); // Update the state
+        queueQdnPublishPrompt(
+          buildQdnSyncPayload({ updatedTree: updatedFileSystem })
+        );
         return true;
       }
 
@@ -3029,6 +3192,9 @@ export const Manager = ({
         };
 
         setFileSystem(updatedFileSystem); // Update the state
+        queueQdnPublishPrompt(
+          buildQdnSyncPayload({ updatedTree: updatedFileSystem })
+        );
         return true;
       }
 
@@ -3045,31 +3211,100 @@ export const Manager = ({
 
     if (!over) return;
 
-    const activeIndex = currentFolder.children.findIndex(
-      (item) => getNodeSelectionKey(item) === active.id
-    );
-    const overIndex = currentFolder.children.findIndex(
-      (item) => getNodeSelectionKey(item) === over.id
-    );
+    const activeKey = String(active?.id || "");
+    const overKey = String(over?.id || "");
+    if (!activeKey || activeKey === overKey) return;
 
-    const updatedChildren = arrayMove(
-      currentFolder.children,
-      activeIndex,
-      overIndex
+    const activeItem = currentFolder?.children?.find(
+      (item) => getNodeSelectionKey(item) === activeKey
     );
+    if (!activeItem) return;
 
-    setFileSystem((prev) => {
-      const updateFolder = (folder) => {
-        if (folder.name === currentFolder.name) {
-          return { ...folder, children: updatedChildren };
-        }
-        if (folder.children) {
-          return { ...folder, children: folder.children.map(updateFolder) };
-        }
-        return folder;
-      };
-      return prev.map(updateFolder);
-    });
+    const selectedKeys = new Set(selectedFileKeys);
+    const draggedItems =
+      activeItem?.type === "file" &&
+      selectedKeys.has(activeKey) &&
+      selectedVisibleFiles.length > 1
+        ? currentFolder.children.filter(
+            (item) =>
+              item?.type === "file" && selectedKeys.has(getNodeSelectionKey(item))
+          )
+        : [activeItem];
+
+    const nextTree = cloneFileSystemTree(fileSystem);
+    const sourcePathArray = currentPath;
+
+    const breadcrumbTargetPath = parseBreadcrumbDropTarget(overKey);
+    if (breadcrumbTargetPath) {
+      if (breadcrumbTargetPath.join("/") === sourcePathArray.join("/")) {
+        return;
+      }
+
+      let movedAny = false;
+      for (const node of draggedItems) {
+        movedAny =
+          moveNodeInTree(
+            nextTree,
+            node.name,
+            node.type,
+            sourcePathArray,
+            breadcrumbTargetPath
+          ) || movedAny;
+      }
+
+      if (movedAny) {
+        setFileSystem(nextTree);
+        queueQdnPublishPrompt(buildQdnSyncPayload({ updatedTree: nextTree }));
+        clearSelection();
+      }
+      return;
+    }
+
+    const overItem = currentFolder?.children?.find(
+      (item) => getNodeSelectionKey(item) === overKey
+    );
+    if (!overItem) return;
+
+    if (overItem?.type === "folder") {
+      const targetPathArray = [...currentPath, overItem.name];
+      let movedAny = false;
+      for (const node of draggedItems) {
+        movedAny =
+          moveNodeInTree(
+            nextTree,
+            node.name,
+            node.type,
+            sourcePathArray,
+            targetPathArray
+          ) || movedAny;
+      }
+
+      if (movedAny) {
+        setFileSystem(nextTree);
+        queueQdnPublishPrompt(buildQdnSyncPayload({ updatedTree: nextTree }));
+        clearSelection();
+      }
+      return;
+    }
+
+    if (activeItem?.type === "file" && overItem?.type === "file") {
+      const draggedNames = Array.from(
+        new Set([...draggedItems.map((node) => node.name), overItem.name])
+      );
+      const created = createFolderFromDroppedFilesInTree(
+        nextTree,
+        draggedNames,
+        sourcePathArray,
+        currentPath,
+        "New Folder"
+      );
+      if (created) {
+        setFileSystem(nextTree);
+        queueQdnPublishPrompt(buildQdnSyncPayload({ updatedTree: nextTree }));
+        clearSelection();
+      }
+      return;
+    }
   };
 
   const deleteFolderInCurrent = async (folderName) => {
@@ -3104,6 +3339,9 @@ export const Manager = ({
       if (folderIndex !== -1) {
         currentFolderNode.children.splice(folderIndex, 1); // Remove the folder
         setFileSystem(updatedFileSystem); // Update the state
+        queueQdnPublishPrompt(
+          buildQdnSyncPayload({ updatedTree: updatedFileSystem })
+        );
         return true;
       }
 
@@ -3148,48 +3386,284 @@ export const Manager = ({
     }
   };
 
-  const buildQdnSyncSnapshot = (updatedTree) => {
-    const nextPublic = mode === "public" ? updatedTree : fileSystemPublic;
-    const nextPrivate = mode === "private" ? updatedTree : fileSystemPrivate;
-    const nextGroup =
-      mode === "group"
+  const buildQdnSyncPayload = ({
+    updatedTree = null,
+    publicTree = fileSystemPublic,
+    privateTree = fileSystemPrivate,
+    groupTree = fileSystemGroup,
+    privateIndex = privateResourceIndex,
+  } = {}) => ({
+    public:
+      mode === "public" && updatedTree ? updatedTree : publicTree ?? [],
+    private:
+      mode === "private" && updatedTree ? updatedTree : privateTree ?? [],
+    group:
+      mode === "group" && updatedTree
         ? {
             ...(
-              fileSystemGroup && !Array.isArray(fileSystemGroup)
-                ? fileSystemGroup
-                : {}
+              groupTree && !Array.isArray(groupTree)
+                ? groupTree
+                : initialGroupFileSystem
             ),
             ...(selectedGroup !== null && selectedGroup !== undefined
               ? { [selectedGroup]: updatedTree }
               : {}),
           }
-        : fileSystemGroup && !Array.isArray(fileSystemGroup)
-          ? fileSystemGroup
-          : {};
+        : groupTree && !Array.isArray(groupTree)
+          ? groupTree
+          : initialGroupFileSystem,
+    ...(privateIndex ? { privateResourceIndex: privateIndex } : {}),
+  });
 
-    return stableStringify(
-      normalizeQdnSyncPayloadForComparison({
-        public: nextPublic,
-        private: nextPrivate,
-        group: nextGroup,
-        ...(privateResourceIndex ? { privateResourceIndex } : {}),
-      })
-    );
+  const queueQdnPublishPrompt = (nextPayload) => {
+    if (!nextPayload) return;
+    const qdnOwnerName = activePublishName || myAddress?.name?.name;
+    if (!qdnOwnerName) return;
+    if (!fileSystemLoadedRef.current) return;
+
+    const normalizedPayload = normalizeQdnSyncPayloadForComparison(nextPayload);
+    const currentSnapshot = stableStringify(normalizedPayload);
+    const baselineSnapshot = lastQdnSyncedSnapshotRef.current;
+    if (
+      currentSnapshot === baselineSnapshot ||
+      currentSnapshot === dismissedPublishSnapshotRef.current
+    ) {
+      setQdnBackupDirty(false);
+      qdnPublishPromptRef.current = null;
+      return;
+    }
+    const baselinePayload = (() => {
+      if (!baselineSnapshot) {
+        return {
+          public: [],
+          private: [],
+          group: {},
+          privateResourceIndex: { entries: {} },
+        };
+      }
+      try {
+        return JSON.parse(baselineSnapshot);
+      } catch (error) {
+        return {
+          public: [],
+          private: [],
+          group: {},
+          privateResourceIndex: { entries: {} },
+        };
+      }
+    })();
+    const diff = diffQdnSyncPayload(baselinePayload, normalizedPayload);
+    if (!diff.hasChanges) {
+      setQdnBackupDirty(false);
+      qdnPublishPromptRef.current = null;
+      return;
+    }
+
+    showPublishNotice({
+      type: "publish",
+      title: "Publish Filesystem Backup Update?",
+      intro:
+        "Your local Q-Manager filesystem differs from the last QDN backup.",
+      fromLabel: "Last QDN backup",
+      toLabel: "Current local",
+      fromSummary: summarizeQdnSyncPayload(baselinePayload),
+      toSummary: summarizeQdnSyncPayload(normalizedPayload),
+      diff,
+      confirmLabel: "Publish update",
+      onConfirm: async () => {
+        try {
+          const publishPromise = publishFileSystemQManagerToQDN({
+            fileSystemQManager: {
+              public: nextPayload.public,
+              private: nextPayload.private,
+              group: nextPayload.group,
+            },
+            privateResourceIndex: nextPayload.privateResourceIndex,
+            activePublishName: qdnOwnerName,
+          });
+
+          openToast(publishPromise, {
+            loading: "Publishing filesystem structure to QDN...",
+            success: "Filesystem structure published to QDN",
+            error: (err) =>
+              `Publish failed: ${err?.error || err?.message || err}`,
+          });
+          await publishPromise;
+          lastQdnSyncedSnapshotRef.current = currentSnapshot;
+          dismissedPublishSnapshotRef.current = "";
+          clearPublishNotice();
+        } catch (error) {
+          console.error("Failed to publish filesystem backup update:", error);
+        } finally {
+          setQdnSyncPrompt(null);
+        }
+      },
+      onCancel: () => {
+        dismissedPublishSnapshotRef.current = currentSnapshot;
+        setQdnSyncPrompt(null);
+      },
+    });
   };
 
-  const findNodeInTree = (nodeName, nodeType, tree) => {
-    if (!tree || !Array.isArray(tree)) return null;
-    // Check root-level direct children
-    for (const node of tree) {
-      if (node.name === nodeName && node.type === nodeType) {
-        return { parent: tree, index: tree.indexOf(node) };
+  const cloneFileSystemTree = (tree) => JSON.parse(JSON.stringify(tree || []));
+
+  const getFolderNodeByPath = (tree, pathArray) => {
+    if (
+      !Array.isArray(tree) ||
+      !Array.isArray(pathArray) ||
+      pathArray.length === 0
+    ) {
+      return null;
+    }
+
+    let currentNodes = tree;
+    let folderNode = null;
+
+    for (const segment of pathArray) {
+      folderNode = currentNodes.find(
+        (node) => node?.type === "folder" && node?.name === segment
+      );
+      if (!folderNode) {
+        return null;
       }
-      if (node.children && Array.isArray(node.children)) {
-        const found = findNodeInTree(nodeName, nodeType, node.children);
-        if (found) return found;
+      currentNodes = Array.isArray(folderNode.children) ? folderNode.children : [];
+    }
+
+    return folderNode;
+  };
+
+  const moveNodeInTree = (
+    tree,
+    nodeName,
+    nodeType,
+    sourcePathArray,
+    targetPathArray
+  ) => {
+    if (
+      !Array.isArray(tree) ||
+      !nodeName ||
+      !nodeType ||
+      !Array.isArray(sourcePathArray) ||
+      !Array.isArray(targetPathArray) ||
+      sourcePathArray.length === 0 ||
+      targetPathArray.length === 0
+    ) {
+      return false;
+    }
+
+    if (nodeType === "folder") {
+      const sourceItemPathKey = [...sourcePathArray, nodeName].join("/");
+      const targetFolderKey = targetPathArray.join("/");
+      if (
+        targetFolderKey === sourceItemPathKey ||
+        targetFolderKey.startsWith(`${sourceItemPathKey}/`)
+      ) {
+        return false;
       }
     }
-    return null;
+
+    const sourceFolderNode = getFolderNodeByPath(tree, sourcePathArray);
+    const targetFolderNode = getFolderNodeByPath(tree, targetPathArray);
+    if (!sourceFolderNode || !targetFolderNode) {
+      return false;
+    }
+
+    sourceFolderNode.children = sourceFolderNode.children || [];
+    targetFolderNode.children = targetFolderNode.children || [];
+
+    const sourceIndex = sourceFolderNode.children.findIndex(
+      (node) => node?.name === nodeName && node?.type === nodeType
+    );
+    if (sourceIndex === -1) {
+      return false;
+    }
+
+    const [nodeToMove] = sourceFolderNode.children.splice(sourceIndex, 1);
+    const existingNames = targetFolderNode.children
+      .filter((node) => node?.type === nodeType)
+      .map((node) => node.name);
+    const nextNode = {
+      ...nodeToMove,
+      name: ensureUniqueName(nodeToMove.name, existingNames),
+    };
+
+    if (nextNode.type === "file" && !nextNode.displayName) {
+      nextNode.displayName = nextNode.name;
+    }
+    if (nextNode.type === "folder") {
+      nextNode.children = Array.isArray(nextNode.children)
+        ? nextNode.children
+        : [];
+    }
+
+    targetFolderNode.children.push(nextNode);
+    return true;
+  };
+
+  const createFolderFromDroppedFilesInTree = (
+    tree,
+    nodeNames,
+    sourcePathArray,
+    targetPathArray,
+    folderName = "New Folder"
+  ) => {
+    if (
+      !Array.isArray(tree) ||
+      !Array.isArray(nodeNames) ||
+      nodeNames.length === 0 ||
+      !Array.isArray(sourcePathArray) ||
+      !Array.isArray(targetPathArray)
+    ) {
+      return false;
+    }
+
+    const sourceFolderNode = getFolderNodeByPath(tree, sourcePathArray);
+    const targetFolderNode = getFolderNodeByPath(tree, targetPathArray);
+    if (!sourceFolderNode || !targetFolderNode) {
+      return false;
+    }
+
+    sourceFolderNode.children = sourceFolderNode.children || [];
+    targetFolderNode.children = targetFolderNode.children || [];
+
+    const desiredNames = new Set(nodeNames);
+    const nodesToMove = [];
+    sourceFolderNode.children = sourceFolderNode.children.filter((node) => {
+      if (node?.type !== "file" || !desiredNames.has(node.name)) {
+        return true;
+      }
+      nodesToMove.push(node);
+      return false;
+    });
+
+    if (nodesToMove.length === 0) {
+      return false;
+    }
+
+    const existingFolderNames = targetFolderNode.children
+      .filter((node) => node?.type === "folder")
+      .map((node) => node.name);
+    const nextFolderName = ensureUniqueName(folderName, existingFolderNames);
+    targetFolderNode.children.push({
+      type: "folder",
+      name: nextFolderName,
+      children: nodesToMove.map((node) => ({
+        ...node,
+        ...(node?.type === "file" && !node?.displayName
+          ? { displayName: node.name }
+          : {}),
+      })),
+    });
+
+    return true;
+  };
+
+  const parseBreadcrumbDropTarget = (dropId) => {
+    if (typeof dropId !== "string") return null;
+    if (!dropId.startsWith("breadcrumb|")) return null;
+    const encodedPath = dropId.slice("breadcrumb|".length);
+    const pathArray = encodedPath.split("/").filter(Boolean);
+    return pathArray.length > 0 ? pathArray : null;
   };
 
   const moveNodeByPath = (
@@ -3198,112 +3672,59 @@ export const Manager = ({
     sourcePathArray,
     targetPathArray
   ) => {
-    if (!nodeName || !nodeType || sourcePathArray.length === 0) {
+    if (
+      !nodeName ||
+      !nodeType ||
+      !Array.isArray(sourcePathArray) ||
+      sourcePathArray.length === 0
+    ) {
       console.error("Invalid parameters");
       return false;
     }
-
-    // Search all file systems for the node
-    const fsConfigs = [];
-    if (mode === "public") {
-      fsConfigs.push({ key: "public", data: fileSystemPublic });
-      fsConfigs.push({ key: "private", data: fileSystemPrivate });
-      if (fileSystemGroup && selectedGroup) {
-        fsConfigs.push({
-          key: `group_${selectedGroup}`,
-          data: fileSystemGroup[selectedGroup] || [],
-        });
-      }
-    } else if (mode === "private") {
-      fsConfigs.push({ key: "private", data: fileSystemPrivate });
-      fsConfigs.push({ key: "public", data: fileSystemPublic });
-      if (fileSystemGroup && selectedGroup) {
-        fsConfigs.push({
-          key: `group_${selectedGroup}`,
-          data: fileSystemGroup[selectedGroup] || [],
-        });
-      }
-    } else {
-      fsConfigs.push({
-        key: `group_${selectedGroup}`,
-        data: fileSystemGroup[selectedGroup] || [],
-      });
-      fsConfigs.push({ key: "public", data: fileSystemPublic });
-      fsConfigs.push({ key: "private", data: fileSystemPrivate });
+    if (!Array.isArray(targetPathArray) || targetPathArray.length === 0) {
+      console.error("Invalid target path");
+      return false;
+    }
+    if (!fileSystem || !Array.isArray(fileSystem)) {
+      console.error("Current file system is not available");
+      return false;
     }
 
-    for (const fsConfig of fsConfigs) {
-      if (!fsConfig.data || !Array.isArray(fsConfig.data)) continue;
-
-      const source = findNodeInTree(nodeName, nodeType, fsConfig.data);
-      if (!source) continue;
-
-      const updatedTree = JSON.parse(JSON.stringify(fsConfig.data));
-      const [nodeToMove] =
-        fsConfig.data[source.index].children !== undefined
-          ? updatedTree[source.index].children.splice(0, 1) // node is a direct child of root, not in children array
-          : [updatedTree[source.index]]; // This shouldn't happen for files
-
-      // Rebuild: find the actual node in the deep tree
-      const rebuildMove = () => {
-        let moved = false;
-        const moveInTree = (nodes) => {
-          if (moved) return;
-          for (let i = 0; i < nodes.length; i++) {
-            const n = nodes[i];
-            if (n.name === nodeName && n.type === nodeType) {
-              const [toMove] = nodes.splice(i, 1);
-              moved = true;
-              return toMove;
-            }
-            if (n.children) {
-              const result = moveInTree(n.children);
-              if (result) return result;
-            }
-          }
-          return null;
-        };
-
-        const toMove = moveInTree(JSON.parse(JSON.stringify(updatedTree)));
-        if (!toMove) return null;
-
-        // Find target folder
-        const targetTree = JSON.parse(JSON.stringify(fsConfig.data));
-        const moveInTargetTree = (nodes) => {
-          if (targetPathArray.length === 0) return nodes;
-          let current = nodes;
-          for (const dir of targetPathArray) {
-            const folder = current.find(
-              (n) => n.name === dir && n.type === "folder"
-            );
-            if (!folder) return null;
-            current = folder.children;
-          }
-          return current;
-        };
-
-        const targetFolder = moveInTargetTree(targetTree);
-        if (!targetFolder || !targetFolder.children) return false;
-
-        const existingNames = targetFolder.children
-          .filter((node) => node.type === nodeType)
-          .map((node) => node.name);
-        toMove.name = ensureUniqueName(toMove.name, existingNames);
-        targetFolder.children.push(toMove);
-
-        setFileSystemAtPath(
-          targetPathArray.length === 0 ? [] : targetPathArray,
-          targetTree
-        );
-        return true;
-      };
-
-      const result = rebuildMove();
-      if (result) return true;
+    const sourceFolderKey = sourcePathArray.join("/");
+    const targetFolderKey = targetPathArray.join("/");
+    if (sourceFolderKey === targetFolderKey) {
+      console.error("Source and target folders are the same");
+      return false;
     }
 
-    console.error("Node not found in any file system");
-    return false;
+    // Prevent moving a folder into itself or one of its descendants.
+    if (nodeType === "folder") {
+      const sourceItemPathKey = [...sourcePathArray, nodeName].join("/");
+      if (
+        targetFolderKey === sourceItemPathKey ||
+        targetFolderKey.startsWith(`${sourceItemPathKey}/`)
+      ) {
+        console.error("Cannot move a folder into itself or one of its children");
+        return false;
+      }
+    }
+
+    const updatedTree = cloneFileSystemTree(fileSystem);
+    const moved = moveNodeInTree(
+      updatedTree,
+      nodeName,
+      nodeType,
+      sourcePathArray,
+      targetPathArray
+    );
+    if (!moved) {
+      console.error("Node not found in source folder");
+      return false;
+    }
+
+    setFileSystemAtPath(targetPathArray, updatedTree);
+    queueQdnPublishPrompt(buildQdnSyncPayload({ updatedTree }));
+    return true;
   };
 
   const sensors = useSensors(
@@ -3348,6 +3769,14 @@ export const Manager = ({
     );
   }, [resolvedVisibleItems, selectedFileKeys]);
 
+  const visibleFileKeys = useMemo(
+    () =>
+      resolvedVisibleItems
+        .filter((item) => item?.type === "file")
+        .map((item) => getNodeSelectionKey(item)),
+    [resolvedVisibleItems]
+  );
+
   const selectedSizeSummary = useMemo(() => {
     let totalBytes = 0;
     let knownCount = 0;
@@ -3380,9 +3809,54 @@ export const Manager = ({
     [previewFile, privateResourceIndex]
   );
 
-  const toggleSelectFile = (item) => {
+  const setSelectionAnchor = (key) => {
+    selectionAnchorKeyRef.current = key || "";
+  };
+
+  const selectFileRange = (item) => {
     if (item?.type !== "file") return;
     const key = getNodeSelectionKey(item);
+    const anchorKey = selectionAnchorKeyRef.current;
+    const anchorIndex = visibleFileKeys.indexOf(anchorKey);
+    const targetIndex = visibleFileKeys.indexOf(key);
+
+    if (anchorIndex === -1 || targetIndex === -1) {
+      setSelectionAnchor(key);
+      setSelectedFileKeys([key]);
+      return;
+    }
+
+    const startIndex = Math.min(anchorIndex, targetIndex);
+    const endIndex = Math.max(anchorIndex, targetIndex);
+    const rangeKeys = visibleFileKeys.slice(startIndex, endIndex + 1);
+    setSelectionAnchor(key);
+    setSelectedFileKeys(rangeKeys);
+  };
+
+  const toggleSelectFile = (item, event = null) => {
+    if (item?.type !== "file") return;
+    const key = getNodeSelectionKey(item);
+
+    if (event?.shiftKey) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      selectFileRange(item);
+      return;
+    }
+
+    if (event?.metaKey || event?.ctrlKey) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      setSelectionAnchor(key);
+      setSelectedFileKeys((prev) =>
+        prev.includes(key)
+          ? prev.filter((entry) => entry !== key)
+          : [...prev, key]
+      );
+      return;
+    }
+
+    setSelectionAnchor(key);
     setSelectedFileKeys((prev) =>
       prev.includes(key)
         ? prev.filter((entry) => entry !== key)
@@ -3399,6 +3873,7 @@ export const Manager = ({
   };
 
   const clearSelection = () => {
+    setSelectionAnchor("");
     setSelectedFileKeys([]);
   };
 
@@ -3430,12 +3905,8 @@ export const Manager = ({
       return !selectedKeys.has(getNodeSelectionKey(child));
     });
 
-    // Build snapshot from the modified tree so the auto-sync baseline matches the local filesystem state.
-    const snapshot = buildQdnSyncSnapshot(updatedFileSystem);
-    lastQdnSyncedSnapshotRef.current = snapshot;
-    dismissedPublishSnapshotRef.current = snapshot;
-
     setFileSystem(updatedFileSystem);
+    queueQdnPublishPrompt(buildQdnSyncPayload({ updatedTree: updatedFileSystem }));
     clearSelection();
   };
 
@@ -3533,6 +4004,7 @@ export const Manager = ({
     }
 
     setFileSystem(updatedFileSystem);
+    queueQdnPublishPrompt(buildQdnSyncPayload({ updatedTree: updatedFileSystem }));
 
     setShowBulkMoveModal(false);
     setBulkMoveTargetPath([]);
@@ -3595,6 +4067,7 @@ export const Manager = ({
     const myName = activePublishName || myAddress?.name?.name || "";
 
     const promise = (async () => {
+      skipNextQdnPublishPromptRef.current = true;
       removeSelectedFromManager();
 
       const failures = [];
@@ -3777,8 +4250,10 @@ export const Manager = ({
       // so the diff sees the actual published state after the tombstone publish.
       let currentQdnState = null;
       try {
+        const qdnOwnerName =
+          (await resolvePreferredName(myName, myAddress?.address)) || myName;
         const response = await fetch(
-          `/arbitrary/DOCUMENT_PRIVATE/${myAddress.name.name}/${QDN_STRUCTURE_IDENTIFIER}?encoding=base64`
+          `/arbitrary/DOCUMENT_PRIVATE/${qdnOwnerName}/${QDN_STRUCTURE_IDENTIFIER}?encoding=base64`
         );
         if (response.ok) {
           const encryptedData = await response.text();
@@ -4017,12 +4492,12 @@ export const Manager = ({
           }
           label={
             <Typography sx={{ fontSize: "14px" }}>
-              Sync filesystem backup
+              Notify when backup is outdated
             </Typography>
           }
         />
         {autoQdnFileSystemSync &&
-          qdnPublishNoticeVisible &&
+          qdnBackupDirty &&
           qdnPublishPromptRef.current && (
           <Tooltip title="QDN backup is out of date">
             <Badge
@@ -4150,22 +4625,27 @@ export const Manager = ({
               </>
             ) : (
               <>
-                <ButtonBase
-                  onClick={async () => {
-                    try {
-                      await show("export-data");
-                    } catch (error) {}
-                  }}
-                  sx={{
-                    gap: "5px",
-                    background: "#4444",
-                    padding: "5px",
-                    borderRadius: "5px",
-                  }}
-                >
-                  <SaveAltIcon sx={{ fontSize: "28px" }} />
-                  <Typography variant="body2">Save data</Typography>
-                </ButtonBase>
+                <Tooltip title="Settings">
+                  <ButtonBase
+                    aria-label="Settings"
+                    onClick={async () => {
+                      try {
+                        await show("export-data");
+                      } catch (error) {}
+                    }}
+                    sx={{
+                      minWidth: "42px",
+                      minHeight: "42px",
+                      justifyContent: "center",
+                      gap: "5px",
+                      background: "#4444",
+                      padding: "8px",
+                      borderRadius: "8px",
+                    }}
+                  >
+                    <SettingsOutlinedIcon sx={{ fontSize: "28px" }} />
+                  </ButtonBase>
+                </Tooltip>
                 <ButtonBase
                   onClick={async () => {
                     try {
@@ -4197,8 +4677,8 @@ export const Manager = ({
                     borderRadius: "5px",
                   }}
                 >
-                  <InsertDriveFileIcon sx={{ fontSize: "28px" }} />
-                  <Typography variant="body2">+File</Typography>
+                  <PublishIcon sx={{ fontSize: "28px" }} />
+                  <Typography variant="body2">Publish files</Typography>
                 </ButtonBase>
               </>
             )}
@@ -4249,6 +4729,7 @@ export const Manager = ({
                     accountAddress={myAddress?.address}
                     accountPublicKey={myAddress?.publicKey}
                     privateResourceIndex={privateResourceIndex}
+                    privateThumbnailAttemptedRef={privateThumbnailAttemptedRef}
                     fileSystem={fileSystem}
                     currentPath={currentPath}
                     selected={selectedFileKeys.includes(
@@ -4256,7 +4737,7 @@ export const Manager = ({
                     )}
                     showThumbnails={showThumbnails}
                     showPrivateThumbnails={showPrivateThumbnails}
-                    onToggleSelect={() => toggleSelectFile(item)}
+                    onSelect={(event) => toggleSelectFile(item, event)}
                     moveNode={moveNodeByPath}
                     onPreview={() => {
                       setPreviewFile(item);
@@ -4382,6 +4863,7 @@ export const Manager = ({
               <DialogContent>
                 <Label>Directory name</Label>
                 <input
+                  ref={newDirInputRef}
                   style={{
                     maxWidth: "100%",
                   }}
@@ -4389,6 +4871,14 @@ export const Manager = ({
                   className="custom-input"
                   value={newDirName}
                   onChange={(e) => setNewDirName(e.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    const trimmedName = newDirName.trim();
+                    if (!trimmedName) return;
+                    onOk(trimmedName);
+                  }}
+                  autoFocus
                 />
               </DialogContent>
               <DialogActions>
@@ -4399,7 +4889,6 @@ export const Manager = ({
                   disabled={!newDirName}
                   variant="contained"
                   onClick={() => onOk(newDirName)}
-                  autoFocus
                 >
                   Save
                 </Button>

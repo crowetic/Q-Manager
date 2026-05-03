@@ -13,7 +13,12 @@ import ShortUniqueId from "short-unique-id";
 import Button from "../components/Button";
 import { useDropzone } from "react-dropzone";
 import { privateServices, services } from "../constants";
-import { fileToBase64, objectToBase64 } from "../utils";
+import {
+  createImageThumbnailData64,
+  fileToBase64,
+  objectToBase64,
+  resolvePreferredName,
+} from "../utils";
 import { openToast } from "../components/openToast";
 import { requestQortal } from "../qapp/request";
 import { upsertPrivateResourceIndexEntry } from "../storage";
@@ -129,6 +134,9 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
   const [isLoading, setIsLoading] = useState(false);
   const [file, setFile] = useState(null);
   const ownerName = typeof myName === "string" ? myName : "";
+  const isImageFile = (candidate) =>
+    typeof candidate?.type === "string" &&
+    candidate.type.toLowerCase().startsWith("image/");
 
   const recordPrivateIndexEntry = async ({
     indexOwner,
@@ -139,6 +147,8 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
     encryptionType,
     sharingKey,
     publicKey,
+    thumbnailData64,
+    thumbnailMimeType,
     groupId,
     groupName,
     service,
@@ -161,6 +171,12 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
       encryptionType,
       ...(sharingKey ? { sharingKey } : {}),
       ...(publicKey ? { publicKey } : {}),
+      ...(thumbnailData64
+        ? {
+            thumbnailData64,
+            thumbnailMimeType: thumbnailMimeType || "image/jpeg",
+          }
+        : {}),
       ...(groupId
         ? {
             group: groupId,
@@ -184,7 +200,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
         const findGroup = groups?.find((group)=> group.groupId === selectedGroup)
       if(!findGroup) throw new Error('Cannot find group')
         setIsLoading(true);
-  
+
         const fileExtension = file?.name?.includes(".") ? file.name.split(".").pop() : "";
         const fileTitle =
           file?.name
@@ -198,7 +214,12 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
   
         const constructedIdentifier =
           existingFile?.identifier || `grp-${selectedGroup}-q-manager-${uid.rnd()}`;
-        const base64File = await fileToBase64(file);
+        const [base64File, thumbnail] = await Promise.all([
+          fileToBase64(file),
+          isImageFile(file)
+            ? createImageThumbnailData64(file, file?.type || "image/png")
+            : Promise.resolve(null),
+        ]);
         const encryptedPayload = await buildEncryptedResourcePayload({
           data64: base64File,
           filename,
@@ -236,7 +257,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
               groupName: findGroup?.groupName,
             });
             setFile("");
-            await recordPrivateIndexEntry({
+              await recordPrivateIndexEntry({
               indexOwner: accountAddress || myName,
               identifier: constructedIdentifier,
               filename,
@@ -246,6 +267,12 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
               groupId: selectedGroup,
               groupName: findGroup?.groupName,
               service: requestData?.service,
+              ...(thumbnail?.data64
+                ? {
+                    thumbnailData64: thumbnail.data64,
+                    thumbnailMimeType: thumbnail.mimeType,
+                  }
+                : {}),
             });
             return true; // Success
           }
@@ -277,6 +304,12 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
             groupId: selectedGroup,
             groupName: findGroup?.groupName,
             service: requestData?.service,
+            ...(thumbnail?.data64
+              ? {
+                  thumbnailData64: thumbnail.data64,
+                  thumbnailMimeType: thumbnail.mimeType,
+                }
+              : {}),
           });
 
             
@@ -321,7 +354,12 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
   
   
         const constructedIdentifier = existingFile?.identifier || `p-q-manager-858-${uid.rnd()}`;
-        const base64File = await fileToBase64(file);
+        const [base64File, thumbnail] = await Promise.all([
+          fileToBase64(file),
+          isImageFile(file)
+            ? createImageThumbnailData64(file, file?.type || "image/png")
+            : Promise.resolve(null),
+        ]);
         const encryptedPayload = await buildEncryptedResourcePayload({
           data64: base64File,
           filename,
@@ -367,6 +405,12 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
               sharingKey,
               publicKey: accountPublicKey || publicKey,
               service: requestData?.service,
+              ...(thumbnail?.data64
+                ? {
+                    thumbnailData64: thumbnail.data64,
+                    thumbnailMimeType: thumbnail.mimeType,
+                  }
+                : {}),
             });
             return true; // Success
           }
@@ -398,6 +442,12 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
             sharingKey,
             publicKey: accountPublicKey || publicKey,
             service: requestData?.service,
+            ...(thumbnail?.data64
+              ? {
+                  thumbnailData64: thumbnail.data64,
+                  thumbnailMimeType: thumbnail.mimeType,
+                }
+              : {}),
           });
 
             

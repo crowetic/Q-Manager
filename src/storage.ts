@@ -613,7 +613,7 @@ export const publishFileSystemQManagerToQDN = async ({
 
   return requestQortal({
     action: "PUBLISH_QDN_RESOURCE",
-    name: resolvedName,
+    name: activePublishName,
     service: "DOCUMENT_PRIVATE",
     identifier: QDN_STRUCTURE_IDENTIFIER,
     filename: QDN_STRUCTURE_FILENAME,

@@ -34,6 +34,115 @@ export function base64ToUint8Array(base64: string): Uint8Array {
 	return bytes
 }
 
+export function base64ToBlob(
+	base64: string,
+	mimeType = 'application/octet-stream'
+): Blob {
+	return new Blob([base64ToUint8Array(base64)], { type: mimeType })
+}
+
+const loadImageFromUrl = (url: string): Promise<HTMLImageElement> => {
+	return new Promise<HTMLImageElement>((resolve, reject) => {
+		const image = new Image()
+		image.onload = () => resolve(image)
+		image.onerror = () =>
+			reject(new Error('Failed to load image data for thumbnail generation'))
+		image.src = url
+	})
+}
+
+const fitThumbnailDimensions = (
+	width: number,
+	height: number,
+	maxWidth: number,
+	maxHeight: number
+) => {
+	if (!Number.isFinite(width) || width <= 0) width = 1
+	if (!Number.isFinite(height) || height <= 0) height = 1
+	const scale = Math.min(maxWidth / width, maxHeight / height, 1)
+	return {
+		width: Math.max(1, Math.round(width * scale)),
+		height: Math.max(1, Math.round(height * scale)),
+	}
+}
+
+export const createImageThumbnailData64 = async (
+	source: Blob | string,
+	sourceMimeType = 'image/png',
+	options?: {
+		maxWidth?: number
+		maxHeight?: number
+		outputMimeType?: string
+		quality?: number
+		backgroundColor?: string
+	}
+): Promise<
+	| {
+			data64: string
+			mimeType: string
+			width: number
+			height: number
+	  }
+	| null
+> => {
+	if (typeof document === 'undefined' || typeof URL === 'undefined') return null
+
+	const {
+		maxWidth = 160,
+		maxHeight = 160,
+		outputMimeType = 'image/jpeg',
+		quality = 0.82,
+		backgroundColor = '#ffffff',
+	} = options || {}
+
+	const blob =
+		typeof source === 'string' ? base64ToBlob(source, sourceMimeType) : source
+	if (!blob) return null
+
+	let objectUrl = ''
+	try {
+		objectUrl = URL.createObjectURL(blob)
+		const image = await loadImageFromUrl(objectUrl)
+		const sourceWidth = Number(image.naturalWidth || image.width || 1)
+		const sourceHeight = Number(image.naturalHeight || image.height || 1)
+		const { width, height } = fitThumbnailDimensions(
+			sourceWidth,
+			sourceHeight,
+			maxWidth,
+			maxHeight
+		)
+
+		const canvas = document.createElement('canvas')
+		canvas.width = width
+		canvas.height = height
+
+		const context = canvas.getContext('2d')
+		if (!context) return null
+
+		if (outputMimeType === 'image/jpeg') {
+			context.fillStyle = backgroundColor
+			context.fillRect(0, 0, width, height)
+		}
+
+		context.drawImage(image, 0, 0, width, height)
+
+		const dataUrl = canvas.toDataURL(outputMimeType, quality)
+		const commaIndex = dataUrl.indexOf(',')
+		return {
+			data64: commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : '',
+			mimeType: outputMimeType,
+			width,
+			height,
+		}
+	} catch (error) {
+		return null
+	} finally {
+		if (objectUrl) {
+			URL.revokeObjectURL(objectUrl)
+		}
+	}
+}
+
 export function uint8ArrayToObject<T = unknown>(uint8Array: Uint8Array): T {
 	const decoder = new TextDecoder()
 	const jsonString = decoder.decode(uint8Array)

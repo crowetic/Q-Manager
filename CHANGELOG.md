@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- QDN filesystem backups now include both the filesystem snapshot and the private resource index so another node can restore the same local state.
+- Startup now compares the local filesystem state against the published QDN backup and prompts to load the QDN version when they differ.
+- Out-of-date QDN publish state now appears as a small notification badge instead of opening the publish diff immediately.
+- Manual publish/import actions now clear stale publish notifications and keep the sync baseline aligned with the current filesystem state.
+
+### Changed
+
+- The `Sync filesystem backup` toggle now controls publish reminders, not startup restore checks.
+- Auto-sync no longer interrupts the user as soon as a mismatch is detected; the diff is now opened from the notification badge.
+- Private file display labels are kept separate from filesystem identity so private entries do not turn into phantom tree items.
+- Filesystem size summaries continue to report the summed sizes of represented files, which can look large even though the QDN backup payload is metadata-only.
+
+### Fixed
+
+- Deleted private files no longer reappear in sync prompts because publish baselines are normalized from the current filesystem tree plus private index.
+- Restore and publish diffs now compare the filesystem snapshot and private resource index together, which keeps backup decisions accurate.
+- Startup restore prompting now works consistently even when auto-sync is disabled.
+- Large private media previews remain separate from the backup snapshot flow, so preview cost is not the same thing as backup publish size.
+- Successful private previews now refresh the cached thumbnail in the private index, so a better preview can replace a stale image thumbnail.
+
+### Notes
+
+- The QDN backup is still an encrypted metadata snapshot, not the raw contents of every file in the filesystem.
+- Legacy QDN backups remain readable.
+
 ## [0.2.0] - 2026-02-28
 
 ### Added

@@ -1,7 +1,7 @@
 {
-  "name": "QManager",
+  "name": "Q-Manager",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
