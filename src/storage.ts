@@ -1,6 +1,7 @@
 // @ts-nocheck
 import {
   base64ToUint8Array,
+  parseGroupQManagerIdentifier,
   objectToBase64,
   resolvePreferredName,
   uint8ArrayToObject,
@@ -723,6 +724,8 @@ const normalizeDiscoveredResource = (resource, ownerName) => {
   if (identifier === LEGACY_QDN_BACKUP_IDENTIFIER) return null;
   if (isDeleteTombstoneResource(resource)) return null;
 
+  const groupIdentifierInfo = parseGroupQManagerIdentifier(identifier);
+
   const service = getResourceField(resource, ["service", "serviceName"]);
   if (!service || typeof service !== "string") return null;
 
@@ -764,8 +767,16 @@ const normalizeDiscoveredResource = (resource, ownerName) => {
     service,
     qortalName,
     mimeType: mimeType || "application/octet-stream",
-    ...(encryptionType ? { encryptionType } : {}),
-    groupId: Number(groupId) || 0,
+    ...(groupIdentifierInfo
+      ? groupIdentifierInfo.isPrivateGroup
+        ? { encryptionType: "group" }
+        : {}
+      : encryptionType
+        ? { encryptionType }
+        : identifierLower.startsWith("p-") || identifierLower.startsWith("pvt-")
+          ? { encryptionType: "private" }
+          : {}),
+    groupId: Number(groupIdentifierInfo?.groupId) || Number(groupId) || 0,
     ...(sizeInBytes !== undefined ? { sizeInBytes } : {}),
   };
 };

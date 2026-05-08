@@ -60,6 +60,7 @@ import {
 import { SelectedFile } from "./File";
 import { FileSystemBreadcrumbs } from "./FileSystemBreadcrumbs";
 import { Spacer } from "./components/Spacer";
+import { copyEmbedLinkForFile } from "./embedLink";
 import FolderIcon from "@mui/icons-material/Folder";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
 import CreateNewFolderIcon from "@mui/icons-material/CreateNewFolder";
@@ -72,6 +73,9 @@ import {
   createImageThumbnailData64,
   handleImportClick,
   objectToBase64,
+  parseGroupQManagerIdentifier,
+  normalizeGroupId,
+  isPrivateGroupQManagerIdentifier,
   resolvePreferredName,
   uint8ArrayToObject,
 } from "./utils";
@@ -166,14 +170,14 @@ const isEncryptedResource = (file) => {
   const service = safeUpper(getServiceName(file));
   const identifier = safeLower(file?.identifier);
   const encryptionType = safeLower(file?.encryptionType);
+  const isPrivateGroupIdentifier =
+    isPrivateGroupQManagerIdentifier(file?.identifier);
   return (
-    Boolean(file?.group || file?.groupId) ||
     encryptionType.includes("private") ||
-    encryptionType.includes("group") ||
+    isPrivateGroupIdentifier ||
     service.includes("_PRIVATE") ||
     identifier.startsWith("p-") ||
-    identifier.startsWith("pvt-") ||
-    identifier.startsWith("grp-")
+    identifier.startsWith("pvt-")
   );
 };
 
@@ -800,7 +804,9 @@ const cachePrivatePreviewThumbnail = async (
       thumbnailData64: thumbnail.data64,
       thumbnailMimeType: thumbnail.mimeType || "image/jpeg",
     });
+    return thumbnail;
   } catch (error) {}
+  return null;
 };
 
 const fetchResourceBase64 = async (file, signal) => {
@@ -969,7 +975,7 @@ const fetchPreviewPayload = async (
       cacheThumbnail &&
       inferPreviewKindFromMimeType(rawPayloadMimeType) === "image"
     ) {
-      await cachePrivatePreviewThumbnail(
+      const thumbnail = await cachePrivatePreviewThumbnail(
         file,
         accountAddress,
         rawPayload.data64,
@@ -977,6 +983,13 @@ const fetchPreviewPayload = async (
         privateIndexEntry,
         { force: true }
       );
+      if (thumbnail?.data64) {
+        return {
+          ...rawPayload,
+          thumbnailData64: thumbnail.data64,
+          thumbnailMimeType: thumbnail.mimeType || "image/jpeg",
+        };
+      }
     }
     return rawPayload;
   }
@@ -1004,7 +1017,7 @@ const fetchPreviewPayload = async (
     cacheThumbnail &&
     inferPreviewKindFromMimeType(decryptedPayloadMimeType) === "image"
   ) {
-    await cachePrivatePreviewThumbnail(
+    const thumbnail = await cachePrivatePreviewThumbnail(
       file,
       accountAddress,
       decrypted.data64,
@@ -1012,6 +1025,14 @@ const fetchPreviewPayload = async (
       privateIndexEntry,
       { force: true }
     );
+    if (thumbnail?.data64) {
+      return {
+        data64: decrypted.data64,
+        metadata: decrypted.metadata,
+        thumbnailData64: thumbnail.data64,
+        thumbnailMimeType: thumbnail.mimeType || "image/jpeg",
+      };
+    }
   }
   return {
       data64: decrypted.data64,
@@ -1244,6 +1265,68 @@ const formatBytes = (value) => {
   }
   if (unitIndex < 0) return `${bytes} B`;
   return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unitIndex]}`;
+};
+
+const countFileNodesInTree = (tree) => {
+  let count = 0;
+
+  const walk = (nodes) => {
+    if (!Array.isArray(nodes)) return;
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      if (node.type === "file") {
+        count += 1;
+      }
+      if (Array.isArray(node.children)) {
+        walk(node.children);
+      }
+    }
+  };
+
+  walk(tree);
+  return count;
+};
+
+const getEmbeddedGroupIdHint = (myAddress) => {
+  if (typeof window === "undefined") {
+    return (
+      normalizeGroupId(myAddress?.defaultGroupId) ||
+      normalizeGroupId(myAddress?.groupId) ||
+      normalizeGroupId(myAddress?.currentGroupId) ||
+      null
+    );
+  }
+
+  const searchParams = new URLSearchParams(window.location?.search || "");
+  const candidates = [
+    window.qappCore?.currentGroupId,
+    window.qappCore?.selectedGroupId,
+    window.qappCore?.groupId,
+    window.qappCore?.group?.groupId,
+    window.QAppCore?.currentGroupId,
+    window.QAppCore?.selectedGroupId,
+    window.QAppCore?.groupId,
+    window.QAppCore?.group?.groupId,
+    window.qapp?.currentGroupId,
+    window.qapp?.selectedGroupId,
+    window.qapp?.groupId,
+    window.qapp?.group?.groupId,
+    searchParams.get("groupId"),
+    searchParams.get("selectedGroupId"),
+    searchParams.get("currentGroupId"),
+    myAddress?.defaultGroupId,
+    myAddress?.groupId,
+    myAddress?.currentGroupId,
+  ];
+
+  for (const candidate of candidates) {
+    const normalizedGroupId = normalizeGroupId(candidate);
+    if (normalizedGroupId) {
+      return normalizedGroupId;
+    }
+  }
+
+  return null;
 };
 
 const getNodeSelectionKey = (item) =>
@@ -1625,8 +1708,17 @@ const FilePreviewDialog = ({
           accountPublicKey
         );
         if (disposed) return;
-        if (payload?.metadata && Object.keys(payload.metadata).length > 0) {
-          onHydrateMetadata?.(payload.metadata);
+        const hydratedMetadata = {
+          ...(payload?.metadata || {}),
+          ...(payload?.thumbnailData64
+            ? {
+                thumbnailData64: payload.thumbnailData64,
+                thumbnailMimeType: payload.thumbnailMimeType,
+              }
+            : {}),
+        };
+        if (Object.keys(hydratedMetadata).length > 0) {
+          onHydrateMetadata?.(hydratedMetadata);
         }
         const payloadMimeType =
           payload?.metadata?.mimeType ||
@@ -2065,6 +2157,17 @@ const SortableItem = ({
     borderRadius: "12px",
     cursor: "grab",
   };
+  const handleCopyEmbedLink = async () => {
+    const promise = copyEmbedLinkForFile({
+      file: item,
+      requestQortal,
+    });
+    await openToast(promise, {
+      loading: "Copying embed link...",
+      success: "Copied successfully!",
+      error: (err) => `Failed to copy: ${err.error || err.message || err}`,
+    });
+  };
 
   return (
     <ContextMenuPinnedFiles
@@ -2077,6 +2180,7 @@ const SortableItem = ({
       moveNode={moveNode}
       item={item}
       onPreview={item?.type === "file" ? onPreview : undefined}
+      onCopyEmbedLink={item?.type === "file" ? handleCopyEmbedLink : undefined}
       onHydrateMetadata={item?.type === "file" ? onHydrateMetadata : undefined}
       pinned={Boolean(item?.pinned)}
       onTogglePin={item?.type === "file" ? onTogglePin : undefined}
@@ -2245,7 +2349,9 @@ export const Manager = ({
   const [fileSystemGroup, setFileSystemGroup] = useState(
     initialGroupFileSystem
   );
-  const [selectedGroup, setSelectedGroup] = useState(null);
+  const [selectedGroup, setSelectedGroup] = useState(() =>
+    getEmbeddedGroupIdHint(myAddress)
+  );
   const publishNames = Array.isArray(myAddress?.names)
     ? myAddress.names.filter((item) => item?.name)
     : myAddress?.name?.name
@@ -2258,6 +2364,7 @@ export const Manager = ({
   const [mode, setMode] = useState("public");
   const [privateIndexRevision, setPrivateIndexRevision] = useState(0);
   const [privateResourceIndex, setPrivateResourceIndex] = useState(null);
+  const fileSystemSnapshotRef = useRef(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return undefined;
@@ -2341,6 +2448,10 @@ export const Manager = ({
     selectedGroup,
   ]);
 
+  useEffect(() => {
+    fileSystemSnapshotRef.current = fileSystem;
+  }, [fileSystem]);
+
   const { isShow, onCancel, onOk, show, type } = useModal();
   const [newDirName, setNewDirName] = useState("");
   const [newName, setNewName] = useState("");
@@ -2397,11 +2508,78 @@ export const Manager = ({
     return folder;
   }, [currentPath, fileSystem]);
 
-  useEffect(() => {
-    if (!selectedGroup && groups?.length > 0) {
-      setSelectedGroup(groups[0]?.groupId);
+  const groupOptions = useMemo(() => {
+    if (!Array.isArray(groups)) return [];
+
+    return groups
+      .map((group) => {
+        const normalizedGroupId = normalizeGroupId(group?.groupId);
+        const fileCount = normalizedGroupId
+          ? countFileNodesInTree(fileSystemGroup?.[normalizedGroupId])
+          : 0;
+
+        return {
+          ...group,
+          normalizedGroupId,
+          fileCount,
+        };
+      })
+      .filter((group) => group.normalizedGroupId !== null)
+      .sort((a, b) => {
+        const countDelta = Number(b.fileCount || 0) - Number(a.fileCount || 0);
+        if (countDelta !== 0) return countDelta;
+
+        const nameDelta = String(a.groupName || `Group ${a.normalizedGroupId}`).localeCompare(
+          String(b.groupName || `Group ${b.normalizedGroupId}`),
+          undefined,
+          {
+            sensitivity: "base",
+          }
+        );
+        if (nameDelta !== 0) return nameDelta;
+
+        return Number(a.normalizedGroupId || 0) - Number(b.normalizedGroupId || 0);
+      });
+  }, [groups, fileSystemGroup]);
+
+  const preferredGroupId = useMemo(() => {
+    if (!groupOptions.length) {
+      return getEmbeddedGroupIdHint(myAddress);
     }
-  }, [groups]);
+
+    const hintedGroupId = getEmbeddedGroupIdHint(myAddress);
+    if (
+      hintedGroupId &&
+      groupOptions.some(
+        (groupOption) =>
+          Number(groupOption.normalizedGroupId) === Number(hintedGroupId)
+      )
+    ) {
+      return hintedGroupId;
+    }
+
+    return groupOptions[0]?.normalizedGroupId || hintedGroupId || null;
+  }, [groupOptions, myAddress]);
+
+  useEffect(() => {
+    if (mode !== "group") return;
+    if (!groupOptions.length) return;
+
+    const normalizedSelectedGroup = normalizeGroupId(selectedGroup);
+    const selectedGroupExists =
+      normalizedSelectedGroup !== null &&
+      groupOptions.some(
+        (groupOption) =>
+          Number(groupOption.normalizedGroupId) === Number(normalizedSelectedGroup)
+      );
+
+    if (selectedGroupExists) return;
+
+    const nextGroupId = preferredGroupId || groupOptions[0]?.normalizedGroupId || null;
+    if (nextGroupId) {
+      setSelectedGroup(nextGroupId);
+    }
+  }, [mode, groupOptions, preferredGroupId, selectedGroup]);
 
   useEffect(() => {
     if (!activePublishName && myAddress?.name?.name) {
@@ -2506,6 +2684,9 @@ export const Manager = ({
       if (currentPrivateResourceIndex) {
         loadedPayload.privateResourceIndex = currentPrivateResourceIndex;
       }
+      lastQdnSyncedSnapshotRef.current = stableStringify(
+        normalizeQdnSyncPayloadForComparison(loadedPayload)
+      );
       setPrivateResourceIndex(currentPrivateResourceIndex);
       if (data?.private && data?.public) {
         setFileSystemPublic(data?.public);
@@ -2701,7 +2882,8 @@ export const Manager = ({
   const addDirectoryToCurrent = (directoryName) => {
     if (!directoryName || currentPath.length === 0) return false;
 
-    const updatedFileSystem = JSON.parse(JSON.stringify(fileSystem)); // Deep copy to avoid state mutation
+    const sourceFileSystem = fileSystemSnapshotRef.current || fileSystem || [];
+    const updatedFileSystem = JSON.parse(JSON.stringify(sourceFileSystem)); // Deep copy to avoid state mutation
     const targetFolder = currentPath[currentPath.length - 1]; // Current directory
     const parents = currentPath.slice(0, -1); // Parent directories
 
@@ -2739,6 +2921,7 @@ export const Manager = ({
         children: [],
       });
 
+      fileSystemSnapshotRef.current = updatedFileSystem;
       setFileSystem(updatedFileSystem); // Update the state
       queueQdnPublishPrompt(
         buildQdnSyncPayload({ updatedTree: updatedFileSystem })
@@ -2751,7 +2934,8 @@ export const Manager = ({
 
   const addNodeByPath = (pathArray = currentPath, newNode) => {
     if (pathArray.length === 0) return false;
-    const updatedFileSystem = JSON.parse(JSON.stringify(fileSystem)); // Deep copy to avoid mutating state
+    const sourceFileSystem = fileSystemSnapshotRef.current || fileSystem || [];
+    const updatedFileSystem = JSON.parse(JSON.stringify(sourceFileSystem)); // Deep copy to avoid mutating state
     const target = pathArray[pathArray.length - 1]; // Last item is the target directory
     const parents = pathArray.slice(0, -1); // All but the last item are parent directories
 
@@ -2786,6 +2970,7 @@ export const Manager = ({
     }
 
     targetNode.children.push(nextNode);
+    fileSystemSnapshotRef.current = updatedFileSystem;
     setFileSystem(updatedFileSystem);
     queueQdnPublishPrompt(buildQdnSyncPayload({ updatedTree: updatedFileSystem }));
 
@@ -2952,11 +3137,10 @@ export const Manager = ({
       const groupedByTarget = discovered.reduce(
         (acc, resource) => {
           const identifier = resource?.identifier || "";
-          const groupFromIdentifier = /^grp-(\d+)-q-manager/i.exec(identifier);
+          const groupFromIdentifier = parseGroupQManagerIdentifier(identifier);
           const inferredGroupId =
+            Number(groupFromIdentifier?.groupId) ||
             Number(resource?.groupId) ||
-            Number(groupFromIdentifier?.[1]) ||
-            (identifier.startsWith("grp-") ? Number(selectedGroup) || 0 : 0) ||
             0;
           const normalizedResource = {
             type: "file",
@@ -2971,12 +3155,19 @@ export const Manager = ({
             qortalName: resource?.qortalName || ownerName,
             mimeType: resource?.mimeType,
             sizeInBytes: resource?.sizeInBytes,
+            ...(groupFromIdentifier
+              ? groupFromIdentifier.isPrivateGroup
+                ? { encryptionType: "group" }
+                : {}
+              : resource?.encryptionType
+                ? { encryptionType: resource.encryptionType }
+                : {}),
             ...(inferredGroupId > 0
               ? {
                   group: inferredGroupId,
                   groupName:
                     groups?.find(
-                      (groupItem) => groupItem.groupId === inferredGroupId
+                      (groupItem) => Number(groupItem.groupId) === Number(inferredGroupId)
                     )?.groupName || `Group ${inferredGroupId}`,
                 }
               : {}),
@@ -3749,7 +3940,8 @@ export const Manager = ({
     return baseItems.filter(
       (item) =>
         item.type === "folder" ||
-        (item.type === "file" && item?.group === selectedGroup)
+        (item.type === "file" &&
+          Number(item?.group) === Number(selectedGroup))
     );
   }, [currentFolder?.children, mode, selectedGroup]);
 
@@ -3910,8 +4102,30 @@ export const Manager = ({
     clearSelection();
   };
 
+  const getBulkMoveRootDirectories = () => {
+    if (Array.isArray(fileSystem)) {
+      return fileSystem;
+    }
+
+    if (fileSystem && typeof fileSystem === "object") {
+      if (selectedGroup && Array.isArray(fileSystem[selectedGroup])) {
+        return fileSystem[selectedGroup];
+      }
+
+      const firstTree = Object.values(fileSystem).find((tree) =>
+        Array.isArray(tree)
+      );
+      if (firstTree) {
+        return firstTree;
+      }
+    }
+
+    return [];
+  };
+
   const renderFolderTreeForBulkMove = (directories, path = []) => {
-    return (directories || [])
+    const directoryNodes = Array.isArray(directories) ? directories : [];
+    return directoryNodes
       .filter((node) => node?.type === "folder")
       .map((dir) => {
         const fullPath = [...path, dir.name];
@@ -4017,17 +4231,13 @@ export const Manager = ({
     );
   };
 
-  const isGroupResource = (file) => {
-    return Boolean(file?.group || file?.groupId);
-  };
-
   const isPrivateFile = (file) => {
     // Check encryptionType field (e.g., "private" or "group")
     const encryptionType =
       typeof file?.encryptionType === "string"
         ? file.encryptionType.toLowerCase()
         : "";
-    if (encryptionType === "private" || encryptionType === "group") {
+    if (encryptionType === "private") {
       return true;
     }
     // Also check if service name indicates private
@@ -4044,13 +4254,23 @@ export const Manager = ({
       const idLower = identifier.toLowerCase();
       if (
         idLower.startsWith("p-") ||
-        idLower.startsWith("pvt-") ||
-        idLower.startsWith("grp-")
+        idLower.startsWith("pvt-")
       ) {
         return true;
       }
     }
     return false;
+  };
+
+  const isGroupEncryptedFile = (file) => {
+    const encryptionType =
+      typeof file?.encryptionType === "string"
+        ? file.encryptionType.toLowerCase()
+        : "";
+    if (encryptionType === "group" && isPrivateGroupQManagerIdentifier(file?.identifier)) {
+      return true;
+    }
+    return isPrivateGroupQManagerIdentifier(file?.identifier);
   };
 
   const getPrivateServiceName = (file) => {
@@ -4065,183 +4285,157 @@ export const Manager = ({
 
     const accountPublicKey = myAddress?.publicKey || "";
     const myName = activePublishName || myAddress?.name?.name || "";
+    const tombstonePayload = btoa("d");
+
+    const buildDeletePublishResource = async (file) => {
+      if (isGroupEncryptedFile(file)) {
+        const groupId = normalizeGroupId(file?.groupId || file?.group);
+        if (!groupId) {
+          throw new Error("missing group id");
+        }
+
+        const encryptedResponse = await requestQortal({
+          action: "ENCRYPT_QORTAL_GROUP_DATA",
+          data64: tombstonePayload,
+          groupId,
+        });
+        const encryptedData =
+          typeof encryptedResponse === "string"
+            ? encryptedResponse
+            : encryptedResponse?.data64 || encryptedResponse?.encryptedData;
+        if (!encryptedData) {
+          throw new Error("group encryption failed");
+        }
+
+        return {
+          name: myName,
+          service: file.service,
+          identifier: file.identifier,
+          data64: encryptedData,
+          externalEncrypt: true,
+        };
+      }
+
+      if (isPrivateFile(file) || isPrivateService(file.service)) {
+        const targetService = getPrivateServiceName(file) || file.service;
+
+        try {
+          const encryptedResponse = await requestQortal({
+            action: "ENCRYPT_DATA_WITH_SHARING_KEY",
+            base64: tombstonePayload,
+          });
+          const encryptedData =
+            typeof encryptedResponse === "string"
+              ? encryptedResponse
+              : encryptedResponse?.data64 || encryptedResponse?.encryptedData;
+          if (encryptedData) {
+            return {
+              name: myName,
+              service: targetService,
+              identifier: file.identifier,
+              data64: encryptedData,
+              externalEncrypt: true,
+            };
+          }
+        } catch (error) {
+          console.error(
+            "[DELETE] ENCRYPT_DATA_WITH_SHARING_KEY failed for",
+            file.service,
+            file.identifier,
+            error
+          );
+        }
+
+        try {
+          const encryptParams = {
+            action: "ENCRYPT_DATA",
+            data64: tombstonePayload,
+          };
+          if (accountPublicKey) {
+            encryptParams.publicKey = accountPublicKey;
+          }
+          const encryptedResponse = await requestQortal(encryptParams);
+          const encryptedData =
+            typeof encryptedResponse === "string"
+              ? encryptedResponse
+              : encryptedResponse?.data64 || encryptedResponse?.encryptedData;
+          if (encryptedData) {
+            return {
+              name: myName,
+              service: targetService,
+              identifier: file.identifier,
+              data64: encryptedData,
+              externalEncrypt: true,
+            };
+          }
+        } catch (error) {
+          console.error(
+            "[DELETE] ENCRYPT_DATA failed for",
+            file.service,
+            file.identifier,
+            error
+          );
+        }
+
+        throw new Error("encryption failed");
+      }
+
+      return {
+        name: myName,
+        service: file.service,
+        identifier: file.identifier,
+        data64: tombstonePayload,
+      };
+    };
 
     const promise = (async () => {
       skipNextQdnPublishPromptRef.current = true;
       removeSelectedFromManager();
 
       const failures = [];
+      const deletionResources = [];
 
       for (const file of filesToDelete) {
         if (!file?.identifier || !file?.service) continue;
 
-        if (isPrivateFile(file) || isPrivateService(file.service)) {
-          // Private service type or encrypted file - need to publish encrypted data.
-          const tombstonePayload = btoa("d");
-          const sharingKey = file?.sharingKey || file?.key;
-          const targetService = getPrivateServiceName(file) || file.service;
-
-          // Try 1: ENCRYPT_DATA_WITH_SHARING_KEY uses the stored sharing key from private index entry
-          // The Qortal Wallet looks up the sharing key internally using the resource's identifier
-          // Note: ENCRYPT_DATA_WITH_SHARING_KEY uses `base64` param (not data64), and returns a raw base64 string
-          try {
-            console.log(
-              "[DELETE] Try ENCRYPT_DATA_WITH_SHARING_KEY for",
-              file.service,
-              file.identifier
-            );
-            const encryptedResponse = await requestQortal({
-              action: "ENCRYPT_DATA_WITH_SHARING_KEY",
-              base64: tombstonePayload,
-            });
-            console.log(
-              "[DELETE] ENCRYPT_DATA_WITH_SHARING_KEY response type:",
-              typeof encryptedResponse,
-              typeof encryptedResponse === "string"
-                ? "raw string (length " + (encryptedResponse?.length || 0) + ")"
-                : JSON.stringify(encryptedResponse)
-            );
-            // The response is a raw base64 string
-            const encryptedData =
-              typeof encryptedResponse === "string"
-                ? encryptedResponse
-                : encryptedResponse?.data64 || encryptedResponse?.encryptedData;
-            if (encryptedData) {
-              console.log(
-                "[DELETE] Publishing to",
-                targetService,
-                file.identifier,
-                "with encryptedData length",
-                encryptedData.length
-              );
-              const publishResult = await requestQortal({
-                action: "PUBLISH_QDN_RESOURCE",
-                name: myName,
-                service: targetService,
-                identifier: file.identifier,
-                data64: encryptedData,
-                externalEncrypt: true,
-              });
-              console.log(
-                "[DELETE] PUBLISH_QDN_RESOURCE response:",
-                publishResult
-              );
-              if (publishResult?.identifier) continue;
-            }
-          } catch (error) {
-            console.error(
-              "[DELETE] ENCRYPT_DATA_WITH_SHARING_KEY failed for",
-              file.service,
-              file.identifier,
-              error
-            );
-          }
-
-          // Try 2: ENCRYPT_DATA uses account public key for standard private encryption
-          // ENCRYPT_DATA uses `data64` param and returns a raw base64 string
-          try {
-            console.log(
-              "[DELETE] Try ENCRYPT_DATA for",
-              file.service,
-              file.identifier,
-              "publicKey:",
-              accountPublicKey ? "set" : "MISSING"
-            );
-            const encryptParams = {
-              action: "ENCRYPT_DATA",
-              data64: tombstonePayload,
-            };
-            if (accountPublicKey) {
-              encryptParams.publicKey = accountPublicKey;
-            }
-            const encryptedResponse = await requestQortal(encryptParams);
-            console.log(
-              "[DELETE] ENCRYPT_DATA response type:",
-              typeof encryptedResponse,
-              typeof encryptedResponse === "string"
-                ? "raw string (length " + (encryptedResponse?.length || 0) + ")"
-                : JSON.stringify(encryptedResponse)
-            );
-            // The response is a raw base64 string
-            const encryptedData =
-              typeof encryptedResponse === "string"
-                ? encryptedResponse
-                : encryptedResponse?.data64 || encryptedResponse?.encryptedData;
-            if (encryptedData) {
-              console.log(
-                "[DELETE] Publishing to",
-                targetService,
-                file.identifier,
-                "with encryptedData length",
-                encryptedData.length
-              );
-              const publishResult = await requestQortal({
-                action: "PUBLISH_QDN_RESOURCE",
-                name: myName,
-                service: targetService,
-                identifier: file.identifier,
-                data64: encryptedData,
-                externalEncrypt: true,
-              });
-              console.log(
-                "[DELETE] PUBLISH_QDN_RESOURCE response:",
-                publishResult
-              );
-              if (publishResult?.identifier) continue;
-            }
-          } catch (error) {
-            console.error(
-              "[DELETE] ENCRYPT_DATA failed for",
-              file.service,
-              file.identifier,
-              error
-            );
-          }
-
+        try {
+          const publishResource = await buildDeletePublishResource(file);
+          deletionResources.push(publishResource);
+        } catch (error) {
+          console.error("[DELETE] Failed to build tombstone resource:", error);
           failures.push(
-            `${file.service}/${file.identifier} (encryption failed)`
+            `${file.service}/${file.identifier} (${
+              error?.message || "encryption failed"
+            })`
           );
-        } else if (isGroupResource(file)) {
-          // Group resource - encrypt with group
-          try {
-            const tombstonePayload = btoa("d");
-            const encryptedData = await requestQortal({
-              action: "ENCRYPT_QORTAL_GROUP_DATA",
-              data64: tombstonePayload,
-              groupId: file.group || file.groupId,
-            });
-            if (encryptedData) {
-              const publishResult = await requestQortal({
-                action: "PUBLISH_QDN_RESOURCE",
-                service: file.service,
-                identifier: file.identifier,
-                data64: encryptedData,
-              });
-              if (publishResult?.identifier) continue;
-            }
-          } catch (error) {
-            console.error("Delete: group encryption publish failed:", error);
-          }
+        }
+      }
 
-          failures.push(
-            `${file.service}/${file.identifier} (group encryption failed)`
-          );
-        } else {
-          // Public service - raw data is fine
-          try {
-            const publishResult = await requestQortal({
-              action: "PUBLISH_QDN_RESOURCE",
-              service: file.service,
-              identifier: file.identifier,
-              data64: btoa("d"),
-            });
-            if (publishResult?.identifier) continue;
-          } catch (error) {
-            console.error("Delete: public publish failed:", error);
-          }
+      if (deletionResources.length === 0) {
+        throw new Error(
+          failures.length > 0
+            ? `Failed to prepare tombstones for: ${failures.join(", ")}`
+            : "No deletable files were selected"
+        );
+      }
 
-          failures.push(
-            `${file.service}/${file.identifier} (public publish failed)`
+      if (deletionResources.length === 1) {
+        const publishResult = await requestQortal({
+          action: "PUBLISH_QDN_RESOURCE",
+          ...deletionResources[0],
+        });
+        if (!publishResult?.identifier) {
+          throw new Error("Failed to publish tombstone");
+        }
+      } else {
+        const publishResult = await requestQortal({
+          action: "PUBLISH_MULTIPLE_QDN_RESOURCES",
+          name: myName,
+          resources: deletionResources,
+        });
+        if (!publishResult || publishResult?.error) {
+          throw new Error(
+            publishResult?.error || "Failed to publish tombstones"
           );
         }
       }
@@ -4405,17 +4599,58 @@ export const Manager = ({
             size="small"
             labelId="label-manager-groups"
             id="id-manager-groups"
-            value={selectedGroup}
+            value={selectedGroup || ""}
             displayEmpty
+            renderValue={(value) => {
+              const normalizedValue = normalizeGroupId(value);
+              const selectedOption = groupOptions.find(
+                (groupOption) =>
+                  Number(groupOption.normalizedGroupId) === Number(normalizedValue)
+              );
+
+              if (!selectedOption) {
+                return (
+                  <Typography sx={{ opacity: 0.72, fontSize: "14px" }}>
+                    Select group
+                  </Typography>
+                );
+              }
+
+              return (
+                <Box sx={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <Typography sx={{ fontSize: "14px" }}>
+                    {selectedOption.groupName}
+                  </Typography>
+                  <Box
+                    sx={{
+                      minWidth: "28px",
+                      px: "8px",
+                      py: "1px",
+                      borderRadius: "999px",
+                      backgroundColor: "rgba(255,255,255,0.12)",
+                      color: "#fff",
+                      fontSize: "12px",
+                      lineHeight: 1.5,
+                      textAlign: "center",
+                    }}
+                  >
+                    {selectedOption.fileCount}
+                  </Box>
+                </Box>
+              );
+            }}
             onChange={(e) => {
               clearSelection();
-              if (!selectedGroup && groups?.length > 0 && !e.target.value) {
+              const nextGroupId = normalizeGroupId(e.target.value);
+              if (!nextGroupId) {
                 setCurrentPath(["Root"]);
-                setSelectedGroup(groups[0]?.groupId);
+                setSelectedGroup(
+                  preferredGroupId || groupOptions[0]?.normalizedGroupId || null
+                );
                 return;
               }
               setCurrentPath(["Root"]);
-              setSelectedGroup(e.target.value);
+              setSelectedGroup(nextGroupId);
             }}
             sx={{
               width: "300px",
@@ -4428,11 +4663,41 @@ export const Manager = ({
                 },
               },
             }}
-          >
-            {groups?.map((group) => {
+            >
+            {groupOptions?.map((group) => {
               return (
-                <MenuItem key={group.groupId} value={group.groupId}>
-                  {group?.groupName}
+                <MenuItem
+                  key={group.normalizedGroupId}
+                  value={group.normalizedGroupId}
+                >
+                  <Box
+                    sx={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "12px",
+                      width: "100%",
+                    }}
+                  >
+                    <Typography sx={{ fontSize: "14px" }}>
+                      {group?.groupName || `Group ${group.normalizedGroupId}`}
+                    </Typography>
+                    <Box
+                      sx={{
+                        minWidth: "28px",
+                        px: "8px",
+                        py: "1px",
+                        borderRadius: "999px",
+                        backgroundColor: "rgba(255,255,255,0.12)",
+                        color: "#fff",
+                        fontSize: "12px",
+                        lineHeight: 1.5,
+                        textAlign: "center",
+                      }}
+                    >
+                      {group.fileCount}
+                    </Box>
+                  </Box>
                 </MenuItem>
               );
             })}
@@ -5155,7 +5420,7 @@ export const Manager = ({
           <Typography sx={{ fontSize: "13px", opacity: 0.75, mb: 2 }}>
             Choose target folder
           </Typography>
-          {renderFolderTreeForBulkMove(fileSystem)}
+          {renderFolderTreeForBulkMove(getBulkMoveRootDirectories())}
           <Box sx={{ mt: 2, display: "flex", gap: "10px" }}>
             <Button
               variant="contained"

@@ -37,6 +37,7 @@ declare global {
     encryptedData?: string
     prefix?: boolean
     exactMatchNames?: boolean
+    groupId?: number
   }
 
   function qortalRequest(options: QortalRequestOptions): Promise<any>

@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - Auto-sync no longer interrupts the user as soon as a mismatch is detected; the diff is now opened from the notification badge.
 - Private file display labels are kept separate from filesystem identity so private entries do not turn into phantom tree items.
 - Filesystem size summaries continue to report the summed sizes of represented files, which can look large even though the QDN backup payload is metadata-only.
+- Group mode now prefers the embedded/current group hint when Q-Manager loads inside Q-Chat, and the group picker shows per-group file counts sorted by the most-populated group first.
 
 ### Fixed
 
@@ -25,6 +26,19 @@ All notable changes to this project will be documented in this file.
 - Startup restore prompting now works consistently even when auto-sync is disabled.
 - Large private media previews remain separate from the backup snapshot flow, so preview cost is not the same thing as backup publish size.
 - Successful private previews now refresh the cached thumbnail in the private index, so a better preview can replace a stale image thumbnail.
+- Group publish actions now normalize group IDs before encryption and publish, which avoids string/number mismatches when selecting a group.
+- Public group publishes now stay unencrypted, while private groups use `ENCRYPT_QORTAL_GROUP_DATA` and write matching entries into the private resource index.
+- Public group files are no longer treated like private resources just because they belong to a group, so previews, thumbnails, and deletes follow the correct path.
+- Group embed links and published identifiers now follow the Q-Chat-compatible `grp-q-manager_0_group_...` / `grp-q-manager_1_group_...` convention, which keeps private group embeds decryptable and public group files unencrypted.
+- Group embed links now also carry the selected `groupId` as a compatibility hint, since the current Q-Chat image embed path decrypts against the active group context.
+- Delete-from-QDN now batches multiple selected files through the multi-publish request instead of republishing tombstones one at a time.
+- Discovery/import now prefers the group ID encoded in the identifier when reconstructing previously published group files, so they land in the correct group bucket instead of the first selected group.
+- Private embed creation now prefers the file node's stored sharing key before querying resource properties, which keeps freshly published private image embeds consistent with the key used to encrypt them.
+- Private and private-group publishes now encrypt the raw file bytes once and publish them as externally encrypted data, while file metadata continues to live in the private resource index.
+- Right-click file menus now include a `copy embed link` action that uses the file's default name and the same embed-link logic as the file details dialog.
+- The app shell now keeps its dark background filled in embedded Q-Chat layouts so the lower page area does not flash white while scrolling.
+- Multi-file publish now updates the live filesystem tree incrementally, so all files in a batch stay visible after group/private publishes.
+- The bulk-move modal now tolerates the group-map fallback state and always renders the active group's folder tree instead of assuming the tree is already an array.
 
 ### Notes
 

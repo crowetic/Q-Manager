@@ -18,6 +18,7 @@ import DriveFileMoveIcon from "@mui/icons-material/DriveFileMove";
 import DriveFileRenameOutlineIcon from "@mui/icons-material/DriveFileRenameOutline";
 import VisibilityIcon from "@mui/icons-material/Visibility";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
+import { isPrivateGroupQManagerIdentifier } from "./utils";
 import { requestQortal } from "./qapp/request";
 
 type MenuPosition = {
@@ -60,13 +61,11 @@ const isEncryptedResourceNode = (node: FileNode | null | undefined) => {
     typeof node?.identifier === "string" ? node.identifier.toLowerCase() : "";
 
   return (
-    Boolean(node?.group || node?.groupId) ||
     encryptionType.includes("private") ||
-    encryptionType.includes("group") ||
+    isPrivateGroupQManagerIdentifier(identifier) ||
     service.includes("_PRIVATE") ||
     identifier.startsWith("p-") ||
-    identifier.startsWith("pvt-") ||
-    identifier.startsWith("grp-")
+    identifier.startsWith("pvt-")
   );
 };
 
@@ -81,6 +80,7 @@ type ContextMenuPinnedFilesProps = {
   currentPath: string[];
   item: FileNode;
   onPreview?: () => void;
+  onCopyEmbedLink?: () => void;
   onHydrateMetadata?: (metadata: Record<string, any>) => void;
   pinned?: boolean;
   onTogglePin?: () => void;
@@ -196,6 +196,7 @@ export const ContextMenuPinnedFiles = ({
   currentPath,
   item,
   onPreview,
+  onCopyEmbedLink,
   onHydrateMetadata,
   pinned,
   onTogglePin,
@@ -386,11 +387,19 @@ export const ContextMenuPinnedFiles = ({
   ]);
 
   const mergedItemInfo = useMemo<Record<string, any>>(() => {
-    if (!resourceProperties) return item;
-    const { key, publicKey, sharingKey, ...safeResourceProperties } =
-      resourceProperties || {};
+    const { key, publicKey, sharingKey, ...safeItem } = item || {};
+    if (!resourceProperties) return safeItem;
+    const {
+      key: resourceKey,
+      publicKey: resourcePublicKey,
+      sharingKey: resourceSharingKey,
+      ...safeResourceProperties
+    } = resourceProperties || {};
+    void resourceKey;
+    void resourcePublicKey;
+    void resourceSharingKey;
     return {
-      ...item,
+      ...safeItem,
       fetchedResourceProperties: safeResourceProperties,
     };
   }, [item, resourceProperties]);
@@ -424,12 +433,6 @@ export const ContextMenuPinnedFiles = ({
               ...(normalized?.title ? { title: normalized.title } : {}),
               ...(normalized?.encryptionType
                 ? { encryptionType: normalized.encryptionType }
-                : {}),
-              ...((response as any)?.key
-                ? { sharingKey: (response as any).key }
-                : {}),
-              ...((response as any)?.sharingKey
-                ? { sharingKey: (response as any).sharingKey }
                 : {}),
               ...((response as any)?.publicKey
                 ? { publicKey: (response as any).publicKey }
@@ -537,6 +540,21 @@ export const ContextMenuPinnedFiles = ({
             </ListItemIcon>
             <Typography variant="inherit" sx={{ fontSize: "14px" }}>
               preview
+            </Typography>
+          </MenuItem>
+        )}
+        {type === "file" && !!onCopyEmbedLink && (
+          <MenuItem
+            onClick={(e) => {
+              handleClose(e);
+              onCopyEmbedLink();
+            }}
+          >
+            <ListItemIcon sx={{ minWidth: "32px" }}>
+              <InfoOutlinedIcon fontSize="small" />
+            </ListItemIcon>
+            <Typography variant="inherit" sx={{ fontSize: "14px" }}>
+              copy embed link
             </Typography>
           </MenuItem>
         )}

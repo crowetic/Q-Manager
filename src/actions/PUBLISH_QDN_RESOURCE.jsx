@@ -15,8 +15,10 @@ import { useDropzone } from "react-dropzone";
 import { privateServices, services } from "../constants";
 import {
   createImageThumbnailData64,
+  buildGroupQManagerIdentifier,
   fileToBase64,
-  objectToBase64,
+  getGroupById,
+  normalizeGroupId,
   resolvePreferredName,
 } from "../utils";
 import { openToast } from "../components/openToast";
@@ -89,20 +91,6 @@ const normalizeEncryptedSharingKeyResponse = (response) => {
     publicKey: "",
     raw: response,
   };
-};
-
-const buildEncryptedResourcePayload = async ({ data64, filename, file }) => {
-  return objectToBase64({
-    qManagerEncryptedResource: true,
-    version: 1,
-    data: data64,
-    metadata: {
-      filename,
-      displayName: filename,
-      mimeType: file?.type || "application/octet-stream",
-      sizeInBytes: Number(file?.size) || 0,
-    },
-  });
 };
 
 export const Label = styled("label")(
@@ -196,9 +184,11 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
         if (!requestData?.service) throw new Error("Please select a service")
         const resolvedOwnerName = await resolvePreferredName(ownerName)
         if (!resolvedOwnerName) throw new Error("Could not determine Qortal name")
-        if(!selectedGroup) throw new Error('Please select a group')
-        const findGroup = groups?.find((group)=> group.groupId === selectedGroup)
-      if(!findGroup) throw new Error('Cannot find group')
+        const selectedGroupId = normalizeGroupId(selectedGroup)
+        if(!selectedGroupId) throw new Error('Please select a group')
+        const findGroup = getGroupById(groups, selectedGroupId)
+        if(!findGroup) throw new Error('Cannot find group')
+        const isPublicGroup = findGroup?.isOpen === true
         setIsLoading(true);
 
         const fileExtension = file?.name?.includes(".") ? file.name.split(".").pop() : "";
@@ -213,33 +203,44 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
   
   
         const constructedIdentifier =
-          existingFile?.identifier || `grp-${selectedGroup}-q-manager-${uid.rnd()}`;
-        const [base64File, thumbnail] = await Promise.all([
-          fileToBase64(file),
-          isImageFile(file)
-            ? createImageThumbnailData64(file, file?.type || "image/png")
-            : Promise.resolve(null),
-        ]);
-        const encryptedPayload = await buildEncryptedResourcePayload({
-          data64: base64File,
-          filename,
-          file,
-        });
-        const encryptedData = await requestQortal({
-          action: "ENCRYPT_QORTAL_GROUP_DATA",
-          data64: encryptedPayload,
-          groupId: selectedGroup
-        });
+          existingFile?.identifier ||
+          buildGroupQManagerIdentifier(
+            selectedGroupId,
+            !isPublicGroup,
+            uid.rnd()
+          );
+        const [base64File, thumbnail] = isPublicGroup
+          ? ["", null]
+          : await Promise.all([
+              fileToBase64(file),
+              isImageFile(file)
+                ? createImageThumbnailData64(file, file?.type || "image/png")
+                : Promise.resolve(null),
+            ]);
+        const encryptedData = isPublicGroup
+          ? ""
+          : await requestQortal({
+              action: "ENCRYPT_QORTAL_GROUP_DATA",
+              data64: base64File,
+              groupId: selectedGroupId
+            });
 
-        if(!encryptedData) throw new Error('Unable to encrypt data')
+        if(!isPublicGroup && !encryptedData) throw new Error('Unable to encrypt data')
   
         let account = await requestQortal({
           action: "PUBLISH_QDN_RESOURCE",
-          name: myName,
+          name: resolvedOwnerName,
           service: existingFile?.service || requestData?.service,
           identifier: constructedIdentifier,
-          data64: encryptedData,
-          externalEncrypt: true,
+          ...(isPublicGroup
+            ? {
+                file,
+                filename,
+              }
+            : {
+                data64: encryptedData,
+                externalEncrypt: true,
+              }),
          
         });
   
@@ -251,12 +252,13 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
               displayName: filename,
               mimeType: file?.type,
               sizeInBytes: file?.size,
-              encryptionType: "group",
-              group: selectedGroup,
-              groupId: selectedGroup,
+              ...(isPublicGroup ? {} : { encryptionType: "group" }),
+              group: selectedGroupId,
+              groupId: selectedGroupId,
               groupName: findGroup?.groupName,
             });
             setFile("");
+            if (isPublicGroup) return true;
               await recordPrivateIndexEntry({
               indexOwner: accountAddress || myName,
               identifier: constructedIdentifier,
@@ -264,7 +266,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
               mimeType: file?.type,
               sizeInBytes: file?.size,
               encryptionType: "group",
-              groupId: selectedGroup,
+              groupId: selectedGroupId,
               groupName: findGroup?.groupName,
               service: requestData?.service,
               ...(thumbnail?.data64
@@ -288,11 +290,18 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
               qortalName: myName,
               identifier: constructedIdentifier,
               service: requestData?.service,
-              group: selectedGroup,
+              ...(isPublicGroup ? {} : { encryptionType: "group" }),
+              group: selectedGroupId,
+              groupId: selectedGroupId,
               groupName: findGroup?.groupName
             },
             undefined
           );
+
+          setFile("");
+          if (isPublicGroup) {
+            return true;
+          }
 
           await recordPrivateIndexEntry({
             indexOwner: accountAddress || myName,
@@ -301,7 +310,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
             mimeType: file?.type,
             sizeInBytes: file?.size,
             encryptionType: "group",
-            groupId: selectedGroup,
+            groupId: selectedGroupId,
             groupName: findGroup?.groupName,
             service: requestData?.service,
             ...(thumbnail?.data64
@@ -360,14 +369,9 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
             ? createImageThumbnailData64(file, file?.type || "image/png")
             : Promise.resolve(null),
         ]);
-        const encryptedPayload = await buildEncryptedResourcePayload({
-          data64: base64File,
-          filename,
-          file,
-        });
         const encryptedResponse = await requestQortal({
           action: "ENCRYPT_DATA_WITH_SHARING_KEY",
-          data64: encryptedPayload,
+          data64: base64File,
         });
         const { data64: encryptedData, sharingKey, publicKey } =
           normalizeEncryptedSharingKeyResponse(encryptedResponse);
@@ -380,6 +384,7 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
           service: existingFile?.service || requestData?.service,
           identifier: constructedIdentifier,
           data64: encryptedData,
+          externalEncrypt: true,
         });
   
         if (account?.identifier) {

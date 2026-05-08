@@ -21,13 +21,16 @@ import { Transition } from "./ShowAction";
 import type { TransitionProps } from "@mui/material/transitions/transition";
 import CloseIcon from "@mui/icons-material/Close";
 import { Label, PUBLISH_QDN_RESOURCE } from "./actions/PUBLISH_QDN_RESOURCE";
-import { base64ToUint8Array, uint8ArrayToObject } from "./utils";
+import {
+  isPrivateGroupQManagerIdentifier,
+} from "./utils";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import { Spacer } from "./components/Spacer";
 import WarningIcon from "@mui/icons-material/Warning";
 import { openToast } from "./components/openToast";
 import { requestQortal } from "./qapp/request";
+import { copyEmbedLinkForFile } from "./embedLink";
 
 const isEncryptedFileNode = (file) => {
   const service =
@@ -40,13 +43,11 @@ const isEncryptedFileNode = (file) => {
     typeof file?.identifier === "string" ? file.identifier.toLowerCase() : "";
 
   return (
-    Boolean(file?.group || file?.groupId) ||
     encryptionType.includes("private") ||
-    encryptionType.includes("group") ||
+    isPrivateGroupQManagerIdentifier(identifier) ||
     service.includes("_PRIVATE") ||
     identifier.startsWith("p-") ||
-    identifier.startsWith("pvt-") ||
-    identifier.startsWith("grp-")
+    identifier.startsWith("pvt-")
   );
 };
 
@@ -132,6 +133,7 @@ export const SelectedFile = ({
     getDisplayName(selectedFile)
   );
   const fileSizeBytes = getFileSizeBytes(selectedFile);
+  const isEncryptedSelectedFile = isEncryptedFileNode(selectedFile);
   useEffect(() => {
     if (selectedFile?.mimeType?.toLowerCase()?.includes("image")) {
       setSelectedType("IMAGE");
@@ -151,88 +153,11 @@ export const SelectedFile = ({
   const createEmbedLink = async () => {
     const promise = (async () => {
       try {
-        if (mode === "public") {
-          await requestQortal({
-            action: "CREATE_AND_COPY_EMBED_LINK",
-            type: selectedType,
-            name: selectedFile.qortalName,
-            identifier: selectedFile.identifier,
-            service: selectedFile.service,
-            mimeType: selectedFile?.mimeType,
-            fileName: customFileName,
-          });
-          return;
-        }
-        if (mode === "group") {
-          await requestQortal({
-            action: "CREATE_AND_COPY_EMBED_LINK",
-            type: selectedType,
-            name: selectedFile.qortalName,
-            identifier: selectedFile.identifier,
-            service: selectedFile.service,
-            mimeType: selectedFile?.mimeType,
-            fileName: customFileName,
-            encryptionType: "group",
-          });
-          return;
-        }
-        const resourcePropertyPayloads = [
-          {
-            action: "GET_QDN_RESOURCE_PROPERTIES",
-            service: selectedFile.service,
-            identifier: selectedFile.identifier,
-            name: selectedFile.qortalName,
-          },
-          {
-            action: "GET_QDN_RESOURCE_PROPERTIES",
-            service: selectedFile.service,
-            identifier: selectedFile.identifier,
-            qortalName: selectedFile.qortalName,
-          },
-          {
-            action: "GET_QDN_RESOURCE_PROPERTIES",
-            service: selectedFile.service,
-            identifier: selectedFile.identifier,
-          },
-        ];
-
-        let responseData: any = null;
-        for (const payload of resourcePropertyPayloads) {
-          try {
-            const response = await requestQortal(payload);
-            if (response && typeof response === "object") {
-              responseData = response;
-              if (responseData?.key || responseData?.sharingKey) break;
-            }
-          } catch (error) {}
-        }
-
-        if (!responseData?.key && !responseData?.sharingKey) {
-          const res = await fetch(
-            `/arbitrary/${selectedFile.service}/${selectedFile.qortalName}/${selectedFile.identifier}?encoding=base64`
-          );
-          const base64Data = await res.text();
-          const decryptedData = await requestQortal({
-            action: "DECRYPT_DATA",
-            encryptedData: base64Data,
-          });
-          const decryptToUnit8Array = base64ToUint8Array(decryptedData);
-          responseData = uint8ArrayToObject(decryptToUnit8Array);
-        }
-
-        const resolvedKey = responseData?.key || responseData?.sharingKey;
-        if (!resolvedKey)
-          throw new Error("Could not find key in encrypted data");
-        await requestQortal({
-          action: "CREATE_AND_COPY_EMBED_LINK",
-          type: selectedType,
-          name: selectedFile.qortalName,
-          identifier: selectedFile.identifier,
-          service: selectedFile.service,
-          encryptionType: "private",
-          key: resolvedKey,
-          mimeType: selectedFile?.mimeType,
-          fileName: customFileName,
+        await copyEmbedLinkForFile({
+          file: selectedFile,
+          requestQortal,
+          selectedType,
+          customFileName,
         });
         return true;
       } catch (error) {
@@ -369,7 +294,7 @@ export const SelectedFile = ({
             {fileSizeBytes === null ? "Unknown" : formatBytes(fileSizeBytes)}
           </Typography>
           <Spacer height="10px" />
-          {mode === "private" && (
+          {isEncryptedSelectedFile && (
             <Box
               sx={{
                 width: "100%",

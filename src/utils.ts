@@ -41,6 +41,89 @@ export function base64ToBlob(
 	return new Blob([base64ToUint8Array(base64)], { type: mimeType })
 }
 
+export function normalizeGroupId(value: unknown): number | null {
+	const parsed = Number(value)
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+export function getGroupById(
+	groups: Array<Record<string, unknown>> | null | undefined,
+	groupId: unknown
+): Record<string, unknown> | null {
+	const normalizedGroupId = normalizeGroupId(groupId)
+	if (!normalizedGroupId || !Array.isArray(groups)) return null
+
+	return (
+		groups.find((group) => {
+			return normalizeGroupId(group?.groupId) === normalizedGroupId
+		}) || null
+	)
+}
+
+export function isGroupOpen(
+	groups: Array<Record<string, unknown>> | null | undefined,
+	groupId: unknown
+): boolean {
+	const group = getGroupById(groups, groupId)
+	return group?.isOpen === true
+}
+
+export function parseGroupQManagerIdentifier(identifier: unknown): {
+	groupId: number | null
+	isPrivateGroup: boolean
+	isPublicGroup: boolean
+} | null {
+	if (typeof identifier !== 'string') return null
+	const trimmed = identifier.trim()
+	if (!trimmed) return null
+
+	const modernMatch = /^grp-q-manager_(0|1)_group_(\d+)(?:_|$)/i.exec(trimmed)
+	if (modernMatch) {
+		const groupId = normalizeGroupId(modernMatch[2])
+		if (!groupId) return null
+		return {
+			groupId,
+			isPrivateGroup: modernMatch[1] === '0',
+			isPublicGroup: modernMatch[1] === '1',
+		}
+	}
+
+	const legacyMatch = /^(grp|gpub)-(\d+)-q-manager/i.exec(trimmed)
+	if (legacyMatch) {
+		const groupId = normalizeGroupId(legacyMatch[2])
+		if (!groupId) return null
+		return {
+			groupId,
+			isPrivateGroup: legacyMatch[1].toLowerCase() === 'grp',
+			isPublicGroup: legacyMatch[1].toLowerCase() === 'gpub',
+		}
+	}
+
+	return null
+}
+
+export function buildGroupQManagerIdentifier(
+	groupId: unknown,
+	isPrivateGroup: boolean,
+	suffix: string
+): string {
+	const normalizedGroupId = normalizeGroupId(groupId)
+	if (!normalizedGroupId) {
+		throw new Error('Please select a group')
+	}
+
+	const safeSuffix = typeof suffix === 'string' && suffix.trim() ? suffix.trim() : `${Date.now()}`
+	return `grp-q-manager_${isPrivateGroup ? 0 : 1}_group_${normalizedGroupId}_${safeSuffix}`
+}
+
+export function isPrivateGroupQManagerIdentifier(identifier: unknown): boolean {
+	return parseGroupQManagerIdentifier(identifier)?.isPrivateGroup === true
+}
+
+export function isPublicGroupQManagerIdentifier(identifier: unknown): boolean {
+	return parseGroupQManagerIdentifier(identifier)?.isPublicGroup === true
+}
+
 const loadImageFromUrl = (url: string): Promise<HTMLImageElement> => {
 	return new Promise<HTMLImageElement>((resolve, reject) => {
 		const image = new Image()

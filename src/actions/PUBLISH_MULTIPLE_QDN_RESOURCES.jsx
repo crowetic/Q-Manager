@@ -11,8 +11,10 @@ import {
 import ShortUniqueId from "short-unique-id";
 import {
   createImageThumbnailData64,
+  buildGroupQManagerIdentifier,
   fileToBase64,
-  objectToBase64,
+  getGroupById,
+  normalizeGroupId,
 } from "../utils";
 import { openToast } from "../components/openToast";
 import Button from "../components/Button";
@@ -90,20 +92,6 @@ const normalizeEncryptedSharingKeyResponse = (response) => {
   };
 };
 
-const buildEncryptedResourcePayload = async ({ data64, filename, file }) => {
-  return objectToBase64({
-    qManagerEncryptedResource: true,
-    version: 1,
-    data: data64,
-    metadata: {
-      filename,
-      displayName: filename,
-      mimeType: file?.type || "application/octet-stream",
-      sizeInBytes: Number(file?.size) || 0,
-    },
-  });
-};
-
 export const Label = styled("label")`
   font-family: 'IBM Plex Sans', sans-serif;
   font-size: 14px;
@@ -142,7 +130,7 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
   });
 
   // Utility: derive filename parts & identifier
-  const makeMeta = (file) => {
+  const makeMeta = (file, isPublicGroup = false, groupId = selectedGroup) => {
     const ext = file.name.includes(".")
       ? file.name.split(".").pop()
       : "";
@@ -153,39 +141,49 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
       .replace(/\s+/g, "_")
       .slice(0, 20) || "untitled";
     const filename = ext ? `${title}.${ext}` : title;
-    const prefix =
-      mode === "public"
-        ? "pub"
-        : mode === "private"
-        ? "pvt"
-        : `grp-${selectedGroup}`;
     const identifier =
       mode === "public"
-        ? `${prefix}-q-manager-${title.toLowerCase()}`
-        : `${prefix}-q-manager-${uid.rnd()}`;
+        ? `pub-q-manager-${title.toLowerCase()}`
+        : mode === "private"
+          ? `p-q-manager-858-${uid.rnd()}`
+          : buildGroupQManagerIdentifier(groupId, !isPublicGroup, uid.rnd());
     return { filename, identifier };
   };
 
   const executeMulti = async () => {
     const promise = (async () => {
-      if (mode === "group" && !selectedGroup)
+      const selectedGroupId = normalizeGroupId(selectedGroup);
+      if (mode === "group" && !selectedGroupId)
         throw new Error("Please select a group");
       if (!requestData?.service) throw new Error("Please select a service");
       const resolvedOwnerName = await resolvePreferredName(ownerName);
       if (!resolvedOwnerName) throw new Error("Could not determine Qortal name");
+      const selectedGroupInfo =
+        mode === "group" ? getGroupById(groups, selectedGroupId) : null;
+      if (mode === "group" && !selectedGroupInfo) {
+        throw new Error("Cannot find group");
+      }
+      const isPublicGroup = selectedGroupInfo?.isOpen === true;
       setIsLoading(true);
 
       // 1) build resources array
       const resources = [];
       const publishedItems = [];
       for (const file of files) {
-        const { filename, identifier } = makeMeta(file);
-        const [data64, thumbnail] = await Promise.all([
-          fileToBase64(file),
-          mode !== "public" && isImageFile(file)
-            ? createImageThumbnailData64(file, file?.type || "image/png")
-            : Promise.resolve(null),
-        ]);
+        const { filename, identifier } = makeMeta(
+          file,
+          isPublicGroup,
+          selectedGroupId
+        );
+        const [data64, thumbnail] =
+          mode === "group" && !isPublicGroup
+            ? await Promise.all([
+                fileToBase64(file),
+                isImageFile(file)
+                  ? createImageThumbnailData64(file, file?.type || "image/png")
+                  : Promise.resolve(null),
+              ])
+            : ["", null];
         const mimeType = file?.type || "application/octet-stream";
         const sizeInBytes = Number(file?.size) || 0;
         const publishedItem = {
@@ -204,35 +202,35 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
         publishedItems.push(publishedItem);
 
         if (mode === "group") {
-          // group‐encrypt
-          const encryptedPayload = await buildEncryptedResourcePayload({
-            data64,
-            filename,
-            file,
-          });
-          const encrypted = await requestQortal({
-            action: "ENCRYPT_QORTAL_GROUP_DATA",
-            data64: encryptedPayload,
-            groupId: selectedGroup,
-          });
-          resources.push({
-            name: myName,
-            service: requestData.service,
-            identifier,
-            mimeType,
-            data64: encrypted,
-            externalEncrypt: true,
-          });
+          if (isPublicGroup) {
+            resources.push({
+              name: resolvedOwnerName,
+              service: requestData.service,
+              identifier,
+              filename,
+              mimeType,
+              file,
+            });
+          } else {
+            // group‐encrypt
+            const encrypted = await requestQortal({
+              action: "ENCRYPT_QORTAL_GROUP_DATA",
+              data64,
+              groupId: selectedGroupId,
+            });
+            resources.push({
+              name: resolvedOwnerName,
+              service: requestData.service,
+              identifier,
+              data64: encrypted,
+              externalEncrypt: true,
+            });
+          }
         } else if (mode === "private") {
           // private‐encrypt
-          const encryptedPayload = await buildEncryptedResourcePayload({
-            data64,
-            filename,
-            file,
-          });
           const encryptedResponse = await requestQortal({
             action: "ENCRYPT_DATA_WITH_SHARING_KEY",
-            data64: encryptedPayload,
+            data64,
           });
           const {
             data64: encrypted,
@@ -243,8 +241,8 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
             name: myName,
             service: requestData.service,
             identifier,
-            mimeType,
             data64: encrypted,
+            externalEncrypt: true,
           });
           publishedItem.sharingKey = sharingKey;
           publishedItem.publicKey = accountPublicKey || publicKey;
@@ -278,8 +276,12 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
         const groupEntry =
           mode === "group"
             ? {
-                group: selectedGroup,
-                groupName: groups?.find((g) => g.groupId === selectedGroup)?.groupName,
+                group: selectedGroupId,
+                groupId: selectedGroupId,
+                groupName:
+                  groups?.find((g) => Number(g.groupId) === selectedGroupId)
+                    ?.groupName,
+                ...(isPublicGroup ? {} : { encryptionType: "group" }),
               }
             : {};
 
@@ -297,13 +299,13 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
           ...groupEntry,
         });
 
-        if (mode !== "public") {
+        if (mode === "private" || (mode === "group" && !isPublicGroup)) {
           await upsertPrivateResourceIndexEntry(indexOwner, {
             resourceKey: [
               accountAddress || myName || indexOwner || "",
               requestData.service || "",
               item.identifier || "",
-              selectedGroup || 0,
+              selectedGroupId || 0,
             ].join("|"),
             qortalName: myName,
             service: requestData.service,
@@ -321,11 +323,11 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
                   thumbnailMimeType: item.thumbnailMimeType || "image/jpeg",
                 }
               : {}),
-            ...(mode === "group"
+            ...(mode === "group" && !isPublicGroup
               ? {
-                  group: selectedGroup,
-                  groupId: selectedGroup,
-                  groupName: groups?.find((g) => g.groupId === selectedGroup)?.groupName,
+                  group: selectedGroupId,
+                  groupId: selectedGroupId,
+                  groupName: groups?.find((g) => Number(g.groupId) === selectedGroupId)?.groupName,
                 }
               : {}),
           });
