@@ -362,13 +362,16 @@ export const PUBLISH_QDN_RESOURCE = ({ addNodeByPath, myName, accountAddress, ac
         const filename = fileExtension ? `${fileTitle}.${fileExtension}` : fileTitle;
   
   
-        const constructedIdentifier = existingFile?.identifier || `p-q-manager-858-${uid.rnd()}`;
+        const constructedIdentifier = existingFile?.identifier || `pvt-q-manager-${uid.rnd()}`;
         const [base64File, thumbnail] = await Promise.all([
           fileToBase64(file),
           isImageFile(file)
             ? createImageThumbnailData64(file, file?.type || "image/png")
             : Promise.resolve(null),
         ]);
+        if (!base64File) {
+          throw new Error("Unable to read file data for private encryption");
+        }
         const encryptedResponse = await requestQortal({
           action: "ENCRYPT_DATA_WITH_SHARING_KEY",
           data64: base64File,

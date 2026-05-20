@@ -2161,6 +2161,8 @@ const SortableItem = ({
     const promise = copyEmbedLinkForFile({
       file: item,
       requestQortal,
+      accountAddress,
+      accountPublicKey,
     });
     await openToast(promise, {
       loading: "Copying embed link...",

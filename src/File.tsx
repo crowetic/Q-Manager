@@ -158,6 +158,8 @@ export const SelectedFile = ({
           requestQortal,
           selectedType,
           customFileName,
+          accountAddress,
+          accountPublicKey,
         });
         return true;
       } catch (error) {

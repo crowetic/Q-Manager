@@ -145,7 +145,7 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
       mode === "public"
         ? `pub-q-manager-${title.toLowerCase()}`
         : mode === "private"
-          ? `p-q-manager-858-${uid.rnd()}`
+          ? `pvt-q-manager-${uid.rnd()}`
           : buildGroupQManagerIdentifier(groupId, !isPublicGroup, uid.rnd());
     return { filename, identifier };
   };
@@ -175,8 +175,10 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
           isPublicGroup,
           selectedGroupId
         );
+        const shouldEncodeBeforePublish =
+          mode === "private" || (mode === "group" && !isPublicGroup);
         const [data64, thumbnail] =
-          mode === "group" && !isPublicGroup
+          shouldEncodeBeforePublish
             ? await Promise.all([
                 fileToBase64(file),
                 isImageFile(file)
@@ -227,6 +229,9 @@ export const PUBLISH_MULTIPLE_QDN_RESOURCES = ({
             });
           }
         } else if (mode === "private") {
+          if (!data64) {
+            throw new Error("Unable to read file data for private encryption");
+          }
           // private‐encrypt
           const encryptedResponse = await requestQortal({
             action: "ENCRYPT_DATA_WITH_SHARING_KEY",
